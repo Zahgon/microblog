@@ -1,21 +1,26 @@
-from flask import render_template, redirect, url_for, flash, request
 from urllib.parse import urlsplit
-from flask_login import login_user, logout_user, current_user
-from flask_babel import _
+from fastapi import Request
 import sqlalchemy as sa
+
 from app import db
 from app.auth import bp
+from app.auth.email import send_password_reset_email
 from app.auth.forms import LoginForm, RegistrationForm, \
     ResetPasswordRequestForm, ResetPasswordForm
+from app.context import flash
+from app.i18n import _
+from app.login import current_user, login_user, logout_user
 from app.models import User
-from app.auth.email import send_password_reset_email
+from app.responses import redirect
+from app.templating import render_template
+from app.urls import url_for
 
 
-@bp.route('/login', methods=['GET', 'POST'])
-def login():
+@bp.api_route('/login', methods=['GET', 'POST'], name='auth.login')
+async def login(request: Request):
     if current_user.is_authenticated:
         return redirect(url_for('main.index'))
-    form = LoginForm()
+    form = await LoginForm.from_formdata(request)
     if form.validate_on_submit():
         user = db.session.scalar(
             sa.select(User).where(User.username == form.username.data))
@@ -23,24 +28,24 @@ def login():
             flash(_('Invalid username or password'))
             return redirect(url_for('auth.login'))
         login_user(user, remember=form.remember_me.data)
-        next_page = request.args.get('next')
+        next_page = request.query_params.get('next')
         if not next_page or urlsplit(next_page).netloc != '':
             next_page = url_for('main.index')
         return redirect(next_page)
     return render_template('auth/login.html', title=_('Sign In'), form=form)
 
 
-@bp.route('/logout')
-def logout():
+@bp.get('/logout', name='auth.logout')
+async def logout():
     logout_user()
     return redirect(url_for('main.index'))
 
 
-@bp.route('/register', methods=['GET', 'POST'])
-def register():
+@bp.api_route('/register', methods=['GET', 'POST'], name='auth.register')
+async def register(request: Request):
     if current_user.is_authenticated:
         return redirect(url_for('main.index'))
-    form = RegistrationForm()
+    form = await RegistrationForm.from_formdata(request)
     if form.validate_on_submit():
         user = User(username=form.username.data, email=form.email.data)
         user.set_password(form.password.data)
@@ -52,11 +57,12 @@ def register():
                            form=form)
 
 
-@bp.route('/reset_password_request', methods=['GET', 'POST'])
-def reset_password_request():
+@bp.api_route('/reset_password_request', methods=['GET', 'POST'],
+              name='auth.reset_password_request')
+async def reset_password_request(request: Request):
     if current_user.is_authenticated:
         return redirect(url_for('main.index'))
-    form = ResetPasswordRequestForm()
+    form = await ResetPasswordRequestForm.from_formdata(request)
     if form.validate_on_submit():
         user = db.session.scalar(
             sa.select(User).where(User.email == form.email.data))
@@ -69,14 +75,15 @@ def reset_password_request():
                            title=_('Reset Password'), form=form)
 
 
-@bp.route('/reset_password/<token>', methods=['GET', 'POST'])
-def reset_password(token):
+@bp.api_route('/reset_password/{token}', methods=['GET', 'POST'],
+              name='auth.reset_password')
+async def reset_password(token: str, request: Request):
     if current_user.is_authenticated:
         return redirect(url_for('main.index'))
     user = User.verify_reset_password_token(token)
     if not user:
         return redirect(url_for('main.index'))
-    form = ResetPasswordForm()
+    form = await ResetPasswordForm.from_formdata(request)
     if form.validate_on_submit():
         user.set_password(form.password.data)
         db.session.commit()

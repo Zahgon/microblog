@@ -8,21 +8,20 @@ from config import Config
 
 class TestConfig(Config):
     TESTING = True
-    SQLALCHEMY_DATABASE_URI = 'sqlite://'
+    DATABASE_URI = 'sqlite://'
     ELASTICSEARCH_URL = None
 
 
 class UserModelCase(unittest.TestCase):
     def setUp(self):
         self.app = create_app(TestConfig)
-        self.app_context = self.app.app_context()
-        self.app_context.push()
+        self.session_scope = db.new_session_scope()
         db.create_all()
 
     def tearDown(self):
         db.session.remove()
         db.drop_all()
-        self.app_context.pop()
+        db.reset_session_scope(self.session_scope)
 
     def test_password_hashing(self):
         u = User(username='susan', email='susan@example.com')

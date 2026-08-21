@@ -6,14 +6,15 @@ from time import time
 from typing import Optional
 import sqlalchemy as sa
 import sqlalchemy.orm as so
-from flask import current_app, url_for
-from flask_login import UserMixin
-from werkzeug.security import generate_password_hash, check_password_hash
 import jwt
 import redis
 import rq
-from app import db, login
+from app import db
+from app.login import UserMixin, login
 from app.search import add_to_index, remove_from_index, query_index
+from app.security import generate_password_hash, check_password_hash
+from app.state import state
+from app.urls import url_for
 
 
 class SearchableMixin:
@@ -26,7 +27,7 @@ class SearchableMixin:
         for i in range(len(ids)):
             when.append((ids[i], i))
         query = sa.select(cls).where(cls.id.in_(ids)).order_by(
-            db.case(*when, value=cls.id))
+            sa.case(*when, value=cls.id))
         return db.session.scalars(query), total
 
     @classmethod
@@ -56,8 +57,8 @@ class SearchableMixin:
             add_to_index(cls.__tablename__, obj)
 
 
-db.event.listen(db.session, 'before_commit', SearchableMixin.before_commit)
-db.event.listen(db.session, 'after_commit', SearchableMixin.after_commit)
+sa.event.listen(db.session, 'before_commit', SearchableMixin.before_commit)
+sa.event.listen(db.session, 'after_commit', SearchableMixin.after_commit)
 
 
 class PaginatedAPIMixin(object):
@@ -87,7 +88,7 @@ class PaginatedAPIMixin(object):
 
 followers = sa.Table(
     'followers',
-    db.metadata,
+    db.Model.metadata,
     sa.Column('follower_id', sa.Integer, sa.ForeignKey('user.id'),
               primary_key=True),
     sa.Column('followed_id', sa.Integer, sa.ForeignKey('user.id'),
@@ -96,6 +97,8 @@ followers = sa.Table(
 
 
 class User(PaginatedAPIMixin, UserMixin, db.Model):
+    __tablename__ = 'user'
+
     id: so.Mapped[int] = so.mapped_column(primary_key=True)
     username: so.Mapped[str] = so.mapped_column(sa.String(64), index=True,
                                                 unique=True)
@@ -181,12 +184,12 @@ class User(PaginatedAPIMixin, UserMixin, db.Model):
     def get_reset_password_token(self, expires_in=600):
         return jwt.encode(
             {'reset_password': self.id, 'exp': time() + expires_in},
-            current_app.config['SECRET_KEY'], algorithm='HS256')
+            state.config['SECRET_KEY'], algorithm='HS256')
 
     @staticmethod
     def verify_reset_password_token(token):
         try:
-            id = jwt.decode(token, current_app.config['SECRET_KEY'],
+            id = jwt.decode(token, state.config['SECRET_KEY'],
                             algorithms=['HS256'])['reset_password']
         except Exception:
             return
@@ -207,8 +210,8 @@ class User(PaginatedAPIMixin, UserMixin, db.Model):
         return n
 
     def launch_task(self, name, description, *args, **kwargs):
-        rq_job = current_app.task_queue.enqueue(f'app.tasks.{name}', self.id,
-                                                *args, **kwargs)
+        rq_job = state.task_queue.enqueue(f'app.tasks.{name}', self.id,
+                                          *args, **kwargs)
         task = Task(id=rq_job.get_id(), name=name, description=description,
                     user=self)
         db.session.add(task)
@@ -285,7 +288,9 @@ def load_user(id):
 
 
 class Post(SearchableMixin, db.Model):
+    __tablename__ = 'post'
     __searchable__ = ['body']
+
     id: so.Mapped[int] = so.mapped_column(primary_key=True)
     body: so.Mapped[str] = so.mapped_column(sa.String(140))
     timestamp: so.Mapped[datetime] = so.mapped_column(
@@ -301,6 +306,8 @@ class Post(SearchableMixin, db.Model):
 
 
 class Message(db.Model):
+    __tablename__ = 'message'
+
     id: so.Mapped[int] = so.mapped_column(primary_key=True)
     sender_id: so.Mapped[int] = so.mapped_column(sa.ForeignKey(User.id),
                                                  index=True)
@@ -322,6 +329,8 @@ class Message(db.Model):
 
 
 class Notification(db.Model):
+    __tablename__ = 'notification'
+
     id: so.Mapped[int] = so.mapped_column(primary_key=True)
     name: so.Mapped[str] = so.mapped_column(sa.String(128), index=True)
     user_id: so.Mapped[int] = so.mapped_column(sa.ForeignKey(User.id),
@@ -336,6 +345,8 @@ class Notification(db.Model):
 
 
 class Task(db.Model):
+    __tablename__ = 'task'
+
     id: so.Mapped[str] = so.mapped_column(sa.String(36), primary_key=True)
     name: so.Mapped[str] = so.mapped_column(sa.String(128), index=True)
     description: so.Mapped[Optional[str]] = so.mapped_column(sa.String(128))
@@ -346,7 +357,7 @@ class Task(db.Model):
 
     def get_rq_job(self):
         try:
-            rq_job = rq.job.Job.fetch(self.id, connection=current_app.redis)
+            rq_job = rq.job.Job.fetch(self.id, connection=state.redis)
         except (redis.exceptions.RedisError, rq.exceptions.NoSuchJobError):
             return None
         return rq_job

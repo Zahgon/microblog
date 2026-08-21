@@ -13,14 +13,18 @@ config = context.config
 fileConfig(config.config_file_name)
 logger = logging.getLogger('alembic.env')
 
-# add your model's MetaData object here
-# for 'autogenerate' support
-# from myapp import mymodel
-# target_metadata = mymodel.Base.metadata
-from flask import current_app
-config.set_main_option('sqlalchemy.url',
-                       current_app.config.get('SQLALCHEMY_DATABASE_URI'))
-target_metadata = current_app.extensions['migrate'].db.metadata
+# the models of the application are registered on the metadata of the
+# declarative base when the app package is imported
+from app import db
+from config import Config
+
+database_uri = Config.DATABASE_URI
+config.set_main_option('sqlalchemy.url', database_uri.replace('%', '%%'))
+target_metadata = db.Model.metadata
+
+# SQLite cannot alter tables, so migrations for it are rendered with the batch
+# operations that Flask-Migrate used to configure automatically
+render_as_batch = database_uri.startswith('sqlite')
 
 # other values from the config, defined by the needs of env.py,
 # can be acquired:
@@ -73,7 +77,7 @@ def run_migrations_online():
     context.configure(connection=connection,
                       target_metadata=target_metadata,
                       process_revision_directives=process_revision_directives,
-                      **current_app.extensions['migrate'].configure_args)
+                      render_as_batch=render_as_batch)
 
     try:
         with context.begin_transaction():

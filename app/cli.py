@@ -1,11 +1,20 @@
+"""Command line interface.
+
+The commands that used to be registered on the Flask CLI are now a standalone
+click application, which is run with ``python -m app.cli``. The ``shell``
+command takes the place of the shell context processor of the Flask version.
+"""
 import os
-from flask import Blueprint
 import click
 
-bp = Blueprint('cli', __name__, cli_group=None)
+
+@click.group()
+def cli():
+    """Microblog command line interface."""
+    pass
 
 
-@bp.cli.group()
+@cli.group()
 def translate():
     """Translation and localization commands."""
     pass
@@ -38,3 +47,22 @@ def compile():
     """Compile all languages."""
     if os.system('pybabel compile -d app/translations'):
         raise RuntimeError('compile command failed')
+
+
+@cli.command()
+def shell():
+    """Run a Python shell with the application objects preloaded."""
+    import code
+    import sqlalchemy as sa
+    import sqlalchemy.orm as so
+    from app import create_app, db
+    from app.models import User, Post, Message, Notification, Task
+
+    create_app()
+    context = {'sa': sa, 'so': so, 'db': db, 'User': User, 'Post': Post,
+               'Message': Message, 'Notification': Notification, 'Task': Task}
+    code.interact(local=context)
+
+
+if __name__ == '__main__':
+    cli()

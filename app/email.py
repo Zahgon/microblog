@@ -1,24 +1,45 @@
+"""Sending of email messages, a replacement for Flask-Mail."""
+import smtplib
+from email.message import EmailMessage
 from threading import Thread
-from flask import current_app
-from flask_mail import Message
-from app import mail
+
+from app.state import state
 
 
-def send_async_email(app, msg):
-    with app.app_context():
-        mail.send(msg)
+def send_async_email(config, msg):
+    _send_message(config, msg)
+
+
+def _send_message(config, msg):
+    server = smtplib.SMTP(config['MAIL_SERVER'], config['MAIL_PORT'])
+    try:
+        if config['MAIL_USE_TLS']:
+            server.starttls()
+        if config['MAIL_USERNAME'] or config['MAIL_PASSWORD']:
+            server.login(config['MAIL_USERNAME'], config['MAIL_PASSWORD'])
+        server.send_message(msg)
+    finally:
+        server.quit()
 
 
 def send_email(subject, sender, recipients, text_body, html_body,
                attachments=None, sync=False):
-    msg = Message(subject, sender=sender, recipients=recipients)
-    msg.body = text_body
-    msg.html = html_body
+    msg = EmailMessage()
+    msg['Subject'] = subject
+    msg['From'] = sender
+    msg['To'] = ', '.join(recipients)
+    msg.set_content(text_body)
+    msg.add_alternative(html_body, subtype='html')
     if attachments:
         for attachment in attachments:
-            msg.attach(*attachment)
+            filename, content_type, data = attachment
+            maintype, _, subtype = content_type.partition('/')
+            if isinstance(data, str):
+                data = data.encode('utf-8')
+            msg.add_attachment(data, maintype=maintype, subtype=subtype,
+                               filename=filename)
+    config = dict(state.config)
     if sync:
-        mail.send(msg)
+        _send_message(config, msg)
     else:
-        Thread(target=send_async_email,
-               args=(current_app._get_current_object(), msg)).start()
+        Thread(target=send_async_email, args=(config, msg)).start()

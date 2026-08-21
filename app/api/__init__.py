@@ -1,5 +1,5 @@
-from flask import Blueprint
+from fastapi import APIRouter
 
-bp = Blueprint('api', __name__)
+bp = APIRouter()
 
 from app.api import users, errors, tokens

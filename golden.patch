@@ -1,0 +1,2986 @@
+diff --git a/.flaskenv b/.flaskenv
+deleted file mode 100644
+index c3fbfe8..0000000
+--- a/.flaskenv
++++ /dev/null
+@@ -1,2 +0,0 @@
+-FLASK_APP=microblog.py
+-FLASK_DEBUG=1
+diff --git a/Dockerfile b/Dockerfile
+index 972b18b..11cc473 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -6,11 +6,10 @@ RUN pip install gunicorn pymysql cryptography
+ 
+ COPY app app
+ COPY migrations migrations
+-COPY microblog.py config.py boot.sh ./
++COPY microblog.py config.py alembic.ini boot.sh ./
+ RUN chmod a+x boot.sh
+ 
+-ENV FLASK_APP microblog.py
+-RUN flask translate compile
++RUN python -m app.cli translate compile
+ 
+ EXPOSE 5000
+ ENTRYPOINT ["./boot.sh"]
+diff --git a/Procfile b/Procfile
+index 62bc894..519004b 100644
+--- a/Procfile
++++ b/Procfile
+@@ -1,2 +1,2 @@
+-web: flask db upgrade; flask translate compile; gunicorn microblog:app
++web: alembic upgrade head; python -m app.cli translate compile; gunicorn -k uvicorn.workers.UvicornWorker microblog:app
+ worker: rq worker microblog-tasks
+diff --git a/README.md b/README.md
+index 8f1210f..0a87754 100644
+--- a/README.md
++++ b/README.md
+@@ -3,3 +3,22 @@
+ This is an example application featured in my [Flask Mega-Tutorial](https://blog.miguelgrinberg.com/post/the-flask-mega-tutorial-part-i-hello-world). See the tutorial for instructions on how to work with it.
+ 
+ The version of the application featured in this repository corresponds to the 2024 edition of the Flask Mega-Tutorial. You can find the 2018 and 2021 versions of the code [here](https://github.com/miguelgrinberg/microblog-2018). And if for any strange reason you are interested in the original code, dating back to 2012, that is [here](https://github.com/miguelgrinberg/microblog-2012).
++
++## Running the application
++
++This version of the application has been ported from Flask to FastAPI, so it
++is run with an ASGI server instead of the Flask development server:
++
++```bash
++uvicorn microblog:app --reload
++```
++
++The commands that were provided by the Flask CLI are now available through the
++command line interface of the application, and the database migrations are
++applied with Alembic:
++
++```bash
++alembic upgrade head            # was: flask db upgrade
++python -m app.cli translate compile   # was: flask translate compile
++python -m app.cli shell               # was: flask shell
++```
+diff --git a/migrations/alembic.ini b/alembic.ini
+similarity index 81%
+rename from migrations/alembic.ini
+rename to alembic.ini
+index f8ed480..b26cb8b 100644
+--- a/migrations/alembic.ini
++++ b/alembic.ini
+@@ -1,6 +1,13 @@
+ # A generic, single database configuration.
+ 
+ [alembic]
++# path to the migration scripts
++script_location = migrations
++
++# the project directory is added to sys.path, so that env.py can import the
++# application
++prepend_sys_path = .
++
+ # template used to generate migration files
+ # file_template = %%(rev)s_%%(slug)s
+ 
+diff --git a/app/__init__.py b/app/__init__.py
+index afcb6a5..07719a5 100644
+--- a/app/__init__.py
++++ b/app/__init__.py
+@@ -1,84 +1,82 @@
+ import logging
+ from logging.handlers import SMTPHandler, RotatingFileHandler
+ import os
+-from flask import Flask, request, current_app
+-from flask_sqlalchemy import SQLAlchemy
+-from flask_migrate import Migrate
+-from flask_login import LoginManager
+-from flask_mail import Mail
+-from flask_moment import Moment
+-from flask_babel import Babel, lazy_gettext as _l
++
+ from elasticsearch import Elasticsearch
++from fastapi import FastAPI
+ from redis import Redis
+ import rq
+-from config import Config
+-
++from starlette.staticfiles import StaticFiles
+ 
+-def get_locale():
+-    return request.accept_languages.best_match(current_app.config['LANGUAGES'])
++from config import Config
++from app import db
++from app.i18n import lazy_gettext as _l
++from app.login import login
++from app.middleware import RequestContextMiddleware
++from app.session import SessionMiddleware
++from app.state import state
+ 
++basedir = os.path.abspath(os.path.dirname(__file__))
+ 
+-db = SQLAlchemy()
+-migrate = Migrate()
+-login = LoginManager()
+ login.login_view = 'auth.login'
+ login.login_message = _l('Please log in to access this page.')
+-mail = Mail()
+-moment = Moment()
+-babel = Babel()
+ 
+ 
+ def create_app(config_class=Config):
+-    app = Flask(__name__)
+-    app.config.from_object(config_class)
+-
+-    db.init_app(app)
+-    migrate.init_app(app, db)
+-    login.init_app(app)
+-    mail.init_app(app)
+-    moment.init_app(app)
+-    babel.init_app(app, locale_selector=get_locale)
+-    app.elasticsearch = Elasticsearch([app.config['ELASTICSEARCH_URL']]) \
+-        if app.config['ELASTICSEARCH_URL'] else None
+-    app.redis = Redis.from_url(app.config['REDIS_URL'])
+-    app.task_queue = rq.Queue('microblog-tasks', connection=app.redis)
+-
+-    from app.errors import bp as errors_bp
+-    app.register_blueprint(errors_bp)
++    app = FastAPI(title='Microblog')
++    state.app = app
++    config = state.init_config(config_class)
++
++    db.init_db(config['DATABASE_URI'])
++    state.elasticsearch = Elasticsearch([config['ELASTICSEARCH_URL']]) \
++        if config['ELASTICSEARCH_URL'] else None
++    state.redis = Redis.from_url(config['REDIS_URL'])
++    state.task_queue = rq.Queue('microblog-tasks', connection=state.redis)
++
++    app.mount('/static', StaticFiles(directory=os.path.join(basedir,
++                                                            'static')),
++              name='static')
++
++    from app.errors import register_error_handlers
++    register_error_handlers(app)
+ 
+     from app.auth import bp as auth_bp
+-    app.register_blueprint(auth_bp, url_prefix='/auth')
++    app.include_router(auth_bp, prefix='/auth')
+ 
+     from app.main import bp as main_bp
+-    app.register_blueprint(main_bp)
+-
+-    from app.cli import bp as cli_bp
+-    app.register_blueprint(cli_bp)
++    app.include_router(main_bp)
+ 
+     from app.api import bp as api_bp
+-    app.register_blueprint(api_bp, url_prefix='/api')
+-
+-    if not app.debug and not app.testing:
+-        if app.config['MAIL_SERVER']:
++    app.include_router(api_bp, prefix='/api')
++
++    from app.errors.handlers import internal_error
++    from app.main.routes import before_request
++    app.add_middleware(RequestContextMiddleware,
++                       before_request=before_request,
++                       error_handler=internal_error)
++    app.add_middleware(SessionMiddleware, secret_key=config['SECRET_KEY'],
++                       session_cookie='session')
++
++    if not config['DEBUG'] and not config['TESTING']:
++        if config['MAIL_SERVER']:
+             auth = None
+-            if app.config['MAIL_USERNAME'] or app.config['MAIL_PASSWORD']:
+-                auth = (app.config['MAIL_USERNAME'],
+-                        app.config['MAIL_PASSWORD'])
++            if config['MAIL_USERNAME'] or config['MAIL_PASSWORD']:
++                auth = (config['MAIL_USERNAME'], config['MAIL_PASSWORD'])
+             secure = None
+-            if app.config['MAIL_USE_TLS']:
++            if config['MAIL_USE_TLS']:
+                 secure = ()
+             mail_handler = SMTPHandler(
+-                mailhost=(app.config['MAIL_SERVER'], app.config['MAIL_PORT']),
+-                fromaddr='no-reply@' + app.config['MAIL_SERVER'],
+-                toaddrs=app.config['ADMINS'], subject='Microblog Failure',
++                mailhost=(config['MAIL_SERVER'], config['MAIL_PORT']),
++                fromaddr='no-reply@' + config['MAIL_SERVER'],
++                toaddrs=config['ADMINS'], subject='Microblog Failure',
+                 credentials=auth, secure=secure)
+             mail_handler.setLevel(logging.ERROR)
+-            app.logger.addHandler(mail_handler)
++            state.logger.addHandler(mail_handler)
+ 
+-        if app.config['LOG_TO_STDOUT']:
++        if config['LOG_TO_STDOUT']:
+             stream_handler = logging.StreamHandler()
+             stream_handler.setLevel(logging.INFO)
+-            app.logger.addHandler(stream_handler)
++            state.logger.addHandler(stream_handler)
+         else:
+             if not os.path.exists('logs'):
+                 os.mkdir('logs')
+@@ -88,10 +86,10 @@ def create_app(config_class=Config):
+                 '%(asctime)s %(levelname)s: %(message)s '
+                 '[in %(pathname)s:%(lineno)d]'))
+             file_handler.setLevel(logging.INFO)
+-            app.logger.addHandler(file_handler)
++            state.logger.addHandler(file_handler)
+ 
+-        app.logger.setLevel(logging.INFO)
+-        app.logger.info('Microblog startup')
++        state.logger.setLevel(logging.INFO)
++        state.logger.info('Microblog startup')
+ 
+     return app
+ 
+diff --git a/app/api/__init__.py b/app/api/__init__.py
+index 61b2e60..919de05 100644
+--- a/app/api/__init__.py
++++ b/app/api/__init__.py
+@@ -1,5 +1,5 @@
+-from flask import Blueprint
++from fastapi import APIRouter
+ 
+-bp = Blueprint('api', __name__)
++bp = APIRouter()
+ 
+ from app.api import users, errors, tokens
+diff --git a/app/api/auth.py b/app/api/auth.py
+index 82ab263..5cd8e9b 100644
+--- a/app/api/auth.py
++++ b/app/api/auth.py
+@@ -1,30 +1,54 @@
+ import sqlalchemy as sa
+-from flask_httpauth import HTTPBasicAuth, HTTPTokenAuth
++from fastapi import Depends
++from fastapi.security import HTTPBasic, HTTPBasicCredentials, HTTPBearer, \
++    HTTPAuthorizationCredentials
++from starlette.exceptions import HTTPException
++
+ from app import db
+ from app.models import User
+-from app.api.errors import error_response
+ 
+-basic_auth = HTTPBasicAuth()
+-token_auth = HTTPTokenAuth()
++basic_auth_scheme = HTTPBasic(auto_error=False)
++token_auth_scheme = HTTPBearer(auto_error=False)
+ 
+ 
+-@basic_auth.verify_password
+ def verify_password(username, password):
+     user = db.session.scalar(sa.select(User).where(User.username == username))
+     if user and user.check_password(password):
+         return user
+ 
+ 
+-@basic_auth.error_handler
+-def basic_auth_error(status):
+-    return error_response(status)
+-
+-
+-@token_auth.verify_token
+ def verify_token(token):
+     return User.check_token(token) if token else None
+ 
+ 
+-@token_auth.error_handler
+-def token_auth_error(status):
+-    return error_response(status)
++def basic_auth_error(status=401):
++    raise HTTPException(status_code=status, headers={
++        'WWW-Authenticate': 'Basic realm="Authentication Required"'})
++
++
++def token_auth_error(status=401):
++    raise HTTPException(status_code=status, headers={
++        'WWW-Authenticate': 'Bearer realm="Authentication Required"'})
++
++
++async def basic_auth(
++        credentials: HTTPBasicCredentials = Depends(basic_auth_scheme)):
++    """Dependency that authenticates a user with its username and password."""
++    user = None
++    if credentials is not None:
++        user = verify_password(credentials.username, credentials.password)
++    if user is None:
++        basic_auth_error(401)
++    return user
++
++
++async def token_auth(
++        credentials: HTTPAuthorizationCredentials = Depends(
++            token_auth_scheme)):
++    """Dependency that authenticates a user with its API token."""
++    user = None
++    if credentials is not None:
++        user = verify_token(credentials.credentials)
++    if user is None:
++        token_auth_error(401)
++    return user
+diff --git a/app/api/errors.py b/app/api/errors.py
+index ece3729..3222b8a 100644
+--- a/app/api/errors.py
++++ b/app/api/errors.py
+@@ -1,19 +1,22 @@
+-from werkzeug.http import HTTP_STATUS_CODES
+-from werkzeug.exceptions import HTTPException
+-from app.api import bp
++from http import HTTPStatus
+ 
++from starlette.responses import JSONResponse
+ 
+-def error_response(status_code, message=None):
+-    payload = {'error': HTTP_STATUS_CODES.get(status_code, 'Unknown error')}
++# The handler that used to be registered on this blueprint for HTTPException
++# is now the application wide handler installed in app/errors/handlers.py,
++# which returns these JSON errors for every request made to the API.
++
++
++def error_response(status_code, message=None, headers=None):
++    try:
++        description = HTTPStatus(status_code).phrase
++    except ValueError:
++        description = 'Unknown error'
++    payload = {'error': description}
+     if message:
+         payload['message'] = message
+-    return payload, status_code
++    return JSONResponse(payload, status_code=status_code, headers=headers)
+ 
+ 
+ def bad_request(message):
+     return error_response(400, message)
+-
+-
+-@bp.errorhandler(HTTPException)
+-def handle_exception(e):
+-    return error_response(e.code)
+diff --git a/app/api/tokens.py b/app/api/tokens.py
+index 29a82a4..d600e02 100644
+--- a/app/api/tokens.py
++++ b/app/api/tokens.py
+@@ -1,19 +1,20 @@
++from fastapi import Depends
++
+ from app import db
+ from app.api import bp
+ from app.api.auth import basic_auth, token_auth
++from app.models import User
+ 
+ 
+-@bp.route('/tokens', methods=['POST'])
+-@basic_auth.login_required
+-def get_token():
+-    token = basic_auth.current_user().get_token()
++@bp.post('/tokens', name='api.get_token')
++async def get_token(user: User = Depends(basic_auth)):
++    token = user.get_token()
+     db.session.commit()
+     return {'token': token}
+ 
+ 
+-@bp.route('/tokens', methods=['DELETE'])
+-@token_auth.login_required
+-def revoke_token():
+-    token_auth.current_user().revoke_token()
++@bp.delete('/tokens', name='api.revoke_token', status_code=204)
++async def revoke_token(user: User = Depends(token_auth)):
++    user.revoke_token()
+     db.session.commit()
+-    return '', 204
++    return None
+diff --git a/app/api/users.py b/app/api/users.py
+index 8a0b59e..14cb05d 100644
+--- a/app/api/users.py
++++ b/app/api/users.py
+@@ -1,50 +1,51 @@
+ import sqlalchemy as sa
+-from flask import request, url_for, abort
++from fastapi import Depends, Request
++from starlette.exceptions import HTTPException
++from starlette.responses import JSONResponse
++
+ from app import db
+-from app.models import User
+ from app.api import bp
+ from app.api.auth import token_auth
+ from app.api.errors import bad_request
++from app.models import User
++from app.params import Page, PerPage
++from app.urls import url_for
+ 
+ 
+-@bp.route('/users/<int:id>', methods=['GET'])
+-@token_auth.login_required
+-def get_user(id):
++@bp.get('/users/{id}', name='api.get_user',
++        dependencies=[Depends(token_auth)])
++async def get_user(id: int):
+     return db.get_or_404(User, id).to_dict()
+ 
+ 
+-@bp.route('/users', methods=['GET'])
+-@token_auth.login_required
+-def get_users():
+-    page = request.args.get('page', 1, type=int)
+-    per_page = min(request.args.get('per_page', 10, type=int), 100)
++@bp.get('/users', name='api.get_users', dependencies=[Depends(token_auth)])
++async def get_users(page: Page = 1, per_page: PerPage = 10):
++    per_page = min(per_page, 100)
+     return User.to_collection_dict(sa.select(User), page, per_page,
+                                    'api.get_users')
+ 
+ 
+-@bp.route('/users/<int:id>/followers', methods=['GET'])
+-@token_auth.login_required
+-def get_followers(id):
++@bp.get('/users/{id}/followers', name='api.get_followers',
++        dependencies=[Depends(token_auth)])
++async def get_followers(id: int, page: Page = 1, per_page: PerPage = 10):
+     user = db.get_or_404(User, id)
+-    page = request.args.get('page', 1, type=int)
+-    per_page = min(request.args.get('per_page', 10, type=int), 100)
++    per_page = min(per_page, 100)
+     return User.to_collection_dict(user.followers.select(), page, per_page,
+                                    'api.get_followers', id=id)
+ 
+ 
+-@bp.route('/users/<int:id>/following', methods=['GET'])
+-@token_auth.login_required
+-def get_following(id):
++@bp.get('/users/{id}/following', name='api.get_following',
++        dependencies=[Depends(token_auth)])
++async def get_following(id: int, page: Page = 1, per_page: PerPage = 10):
+     user = db.get_or_404(User, id)
+-    page = request.args.get('page', 1, type=int)
+-    per_page = min(request.args.get('per_page', 10, type=int), 100)
++    per_page = min(per_page, 100)
+     return User.to_collection_dict(user.following.select(), page, per_page,
+                                    'api.get_following', id=id)
+ 
+ 
+-@bp.route('/users', methods=['POST'])
+-def create_user():
+-    data = request.get_json()
++@bp.post('/users', name='api.create_user')
++async def create_user(request: Request):
++    data = await request.json()
+     if 'username' not in data or 'email' not in data or 'password' not in data:
+         return bad_request('must include username, email and password fields')
+     if db.session.scalar(sa.select(User).where(
+@@ -57,17 +58,17 @@ def create_user():
+     user.from_dict(data, new_user=True)
+     db.session.add(user)
+     db.session.commit()
+-    return user.to_dict(), 201, {'Location': url_for('api.get_user',
+-                                                     id=user.id)}
++    return JSONResponse(user.to_dict(), status_code=201, headers={
++        'Location': url_for('api.get_user', id=user.id)})
+ 
+ 
+-@bp.route('/users/<int:id>', methods=['PUT'])
+-@token_auth.login_required
+-def update_user(id):
+-    if token_auth.current_user().id != id:
+-        abort(403)
++@bp.put('/users/{id}', name='api.update_user')
++async def update_user(id: int, request: Request,
++                      token_user: User = Depends(token_auth)):
++    if token_user.id != id:
++        raise HTTPException(status_code=403)
+     user = db.get_or_404(User, id)
+-    data = request.get_json()
++    data = await request.json()
+     if 'username' in data and data['username'] != user.username and \
+         db.session.scalar(sa.select(User).where(
+             User.username == data['username'])):
+diff --git a/app/auth/__init__.py b/app/auth/__init__.py
+index 088b033..1872386 100644
+--- a/app/auth/__init__.py
++++ b/app/auth/__init__.py
+@@ -1,5 +1,5 @@
+-from flask import Blueprint
++from fastapi import APIRouter
+ 
+-bp = Blueprint('auth', __name__)
++bp = APIRouter()
+ 
+ from app.auth import routes
+diff --git a/app/auth/email.py b/app/auth/email.py
+index 98755ac..674f995 100644
+--- a/app/auth/email.py
++++ b/app/auth/email.py
+@@ -1,14 +1,15 @@
+-from flask import render_template, current_app
+-from flask_babel import _
+ from app.email import send_email
++from app.i18n import _
++from app.state import state
++from app.templating import render_to_string
+ 
+ 
+ def send_password_reset_email(user):
+     token = user.get_reset_password_token()
+     send_email(_('[Microblog] Reset Your Password'),
+-               sender=current_app.config['ADMINS'][0],
++               sender=state.config['ADMINS'][0],
+                recipients=[user.email],
+-               text_body=render_template('email/reset_password.txt',
+-                                         user=user, token=token),
+-               html_body=render_template('email/reset_password.html',
+-                                         user=user, token=token))
++               text_body=render_to_string('email/reset_password.txt',
++                                          user=user, token=token),
++               html_body=render_to_string('email/reset_password.html',
++                                          user=user, token=token))
+diff --git a/app/auth/forms.py b/app/auth/forms.py
+index d8a4bad..86fb719 100644
+--- a/app/auth/forms.py
++++ b/app/auth/forms.py
+@@ -1,20 +1,21 @@
+-from flask_wtf import FlaskForm
+-from flask_babel import _, lazy_gettext as _l
+ from wtforms import StringField, PasswordField, BooleanField, SubmitField
+ from wtforms.validators import ValidationError, DataRequired, Email, EqualTo
+ import sqlalchemy as sa
++
+ from app import db
++from app.forms import BaseForm
++from app.i18n import _, lazy_gettext as _l
+ from app.models import User
+ 
+ 
+-class LoginForm(FlaskForm):
++class LoginForm(BaseForm):
+     username = StringField(_l('Username'), validators=[DataRequired()])
+     password = PasswordField(_l('Password'), validators=[DataRequired()])
+     remember_me = BooleanField(_l('Remember Me'))
+     submit = SubmitField(_l('Sign In'))
+ 
+ 
+-class RegistrationForm(FlaskForm):
++class RegistrationForm(BaseForm):
+     username = StringField(_l('Username'), validators=[DataRequired()])
+     email = StringField(_l('Email'), validators=[DataRequired(), Email()])
+     password = PasswordField(_l('Password'), validators=[DataRequired()])
+@@ -36,12 +37,12 @@ class RegistrationForm(FlaskForm):
+             raise ValidationError(_('Please use a different email address.'))
+ 
+ 
+-class ResetPasswordRequestForm(FlaskForm):
++class ResetPasswordRequestForm(BaseForm):
+     email = StringField(_l('Email'), validators=[DataRequired(), Email()])
+     submit = SubmitField(_l('Request Password Reset'))
+ 
+ 
+-class ResetPasswordForm(FlaskForm):
++class ResetPasswordForm(BaseForm):
+     password = PasswordField(_l('Password'), validators=[DataRequired()])
+     password2 = PasswordField(
+         _l('Repeat Password'), validators=[DataRequired(),
+diff --git a/app/auth/routes.py b/app/auth/routes.py
+index 79360ff..889e0e6 100644
+--- a/app/auth/routes.py
++++ b/app/auth/routes.py
+@@ -1,21 +1,26 @@
+-from flask import render_template, redirect, url_for, flash, request
+ from urllib.parse import urlsplit
+-from flask_login import login_user, logout_user, current_user
+-from flask_babel import _
++from fastapi import Request
+ import sqlalchemy as sa
++
+ from app import db
+ from app.auth import bp
++from app.auth.email import send_password_reset_email
+ from app.auth.forms import LoginForm, RegistrationForm, \
+     ResetPasswordRequestForm, ResetPasswordForm
++from app.context import flash
++from app.i18n import _
++from app.login import current_user, login_user, logout_user
+ from app.models import User
+-from app.auth.email import send_password_reset_email
++from app.responses import redirect
++from app.templating import render_template
++from app.urls import url_for
+ 
+ 
+-@bp.route('/login', methods=['GET', 'POST'])
+-def login():
++@bp.api_route('/login', methods=['GET', 'POST'], name='auth.login')
++async def login(request: Request):
+     if current_user.is_authenticated:
+         return redirect(url_for('main.index'))
+-    form = LoginForm()
++    form = await LoginForm.from_formdata(request)
+     if form.validate_on_submit():
+         user = db.session.scalar(
+             sa.select(User).where(User.username == form.username.data))
+@@ -23,24 +28,24 @@ def login():
+             flash(_('Invalid username or password'))
+             return redirect(url_for('auth.login'))
+         login_user(user, remember=form.remember_me.data)
+-        next_page = request.args.get('next')
++        next_page = request.query_params.get('next')
+         if not next_page or urlsplit(next_page).netloc != '':
+             next_page = url_for('main.index')
+         return redirect(next_page)
+     return render_template('auth/login.html', title=_('Sign In'), form=form)
+ 
+ 
+-@bp.route('/logout')
+-def logout():
++@bp.get('/logout', name='auth.logout')
++async def logout():
+     logout_user()
+     return redirect(url_for('main.index'))
+ 
+ 
+-@bp.route('/register', methods=['GET', 'POST'])
+-def register():
++@bp.api_route('/register', methods=['GET', 'POST'], name='auth.register')
++async def register(request: Request):
+     if current_user.is_authenticated:
+         return redirect(url_for('main.index'))
+-    form = RegistrationForm()
++    form = await RegistrationForm.from_formdata(request)
+     if form.validate_on_submit():
+         user = User(username=form.username.data, email=form.email.data)
+         user.set_password(form.password.data)
+@@ -52,11 +57,12 @@ def register():
+                            form=form)
+ 
+ 
+-@bp.route('/reset_password_request', methods=['GET', 'POST'])
+-def reset_password_request():
++@bp.api_route('/reset_password_request', methods=['GET', 'POST'],
++              name='auth.reset_password_request')
++async def reset_password_request(request: Request):
+     if current_user.is_authenticated:
+         return redirect(url_for('main.index'))
+-    form = ResetPasswordRequestForm()
++    form = await ResetPasswordRequestForm.from_formdata(request)
+     if form.validate_on_submit():
+         user = db.session.scalar(
+             sa.select(User).where(User.email == form.email.data))
+@@ -69,14 +75,15 @@ def reset_password_request():
+                            title=_('Reset Password'), form=form)
+ 
+ 
+-@bp.route('/reset_password/<token>', methods=['GET', 'POST'])
+-def reset_password(token):
++@bp.api_route('/reset_password/{token}', methods=['GET', 'POST'],
++              name='auth.reset_password')
++async def reset_password(token: str, request: Request):
+     if current_user.is_authenticated:
+         return redirect(url_for('main.index'))
+     user = User.verify_reset_password_token(token)
+     if not user:
+         return redirect(url_for('main.index'))
+-    form = ResetPasswordForm()
++    form = await ResetPasswordForm.from_formdata(request)
+     if form.validate_on_submit():
+         user.set_password(form.password.data)
+         db.session.commit()
+diff --git a/app/cli.py b/app/cli.py
+index 25e2a27..5d2866f 100644
+--- a/app/cli.py
++++ b/app/cli.py
+@@ -1,11 +1,20 @@
++"""Command line interface.
++
++The commands that used to be registered on the Flask CLI are now a standalone
++click application, which is run with ``python -m app.cli``. The ``shell``
++command takes the place of the shell context processor of the Flask version.
++"""
+ import os
+-from flask import Blueprint
+ import click
+ 
+-bp = Blueprint('cli', __name__, cli_group=None)
++
++@click.group()
++def cli():
++    """Microblog command line interface."""
++    pass
+ 
+ 
+-@bp.cli.group()
++@cli.group()
+ def translate():
+     """Translation and localization commands."""
+     pass
+@@ -38,3 +47,22 @@ def compile():
+     """Compile all languages."""
+     if os.system('pybabel compile -d app/translations'):
+         raise RuntimeError('compile command failed')
++
++
++@cli.command()
++def shell():
++    """Run a Python shell with the application objects preloaded."""
++    import code
++    import sqlalchemy as sa
++    import sqlalchemy.orm as so
++    from app import create_app, db
++    from app.models import User, Post, Message, Notification, Task
++
++    create_app()
++    context = {'sa': sa, 'so': so, 'db': db, 'User': User, 'Post': Post,
++               'Message': Message, 'Notification': Notification, 'Task': Task}
++    code.interact(local=context)
++
++
++if __name__ == '__main__':
++    cli()
+diff --git a/app/context.py b/app/context.py
+new file mode 100644
+index 0000000..1779fe7
+--- /dev/null
++++ b/app/context.py
+@@ -0,0 +1,72 @@
++"""Per-request context.
++
++Flask kept the current request, the ``g`` namespace and the session in thread
++local proxies. The same job is done here with context variables, which are set
++by the request context middleware installed in ``create_app()``.
++"""
++from contextvars import ContextVar
++from types import SimpleNamespace
++
++_request_ctx = ContextVar('microblog_request', default=None)
++_g_ctx = ContextVar('microblog_g', default=None)
++
++
++def set_request(request):
++    """Bind a request to the current context, returning the reset tokens."""
++    return _request_ctx.set(request), _g_ctx.set(SimpleNamespace())
++
++
++def reset_request(tokens):
++    request_token, g_token = tokens
++    _request_ctx.reset(request_token)
++    _g_ctx.reset(g_token)
++
++
++def get_request():
++    return _request_ctx.get()
++
++
++def get_g():
++    g = _g_ctx.get()
++    if g is None:
++        g = SimpleNamespace()
++        _g_ctx.set(g)
++    return g
++
++
++def get_session():
++    """Return the session of the current request, or an empty dict."""
++    request = get_request()
++    if request is None:
++        return {}
++    return request.session
++
++
++class GProxy:
++    """Proxy that forwards attribute access to the current ``g`` namespace."""
++
++    def __getattr__(self, name):
++        return getattr(get_g(), name)
++
++    def __setattr__(self, name, value):
++        setattr(get_g(), name, value)
++
++    def __delattr__(self, name):
++        delattr(get_g(), name)
++
++    def __contains__(self, name):
++        return hasattr(get_g(), name)
++
++
++g = GProxy()
++
++
++def flash(message):
++    """Store a message to be shown on the next rendered page."""
++    session = get_session()
++    session.setdefault('_flashes', []).append(str(message))
++
++
++def get_flashed_messages():
++    """Return and clear the messages stored by ``flash()``."""
++    return get_session().pop('_flashes', [])
+diff --git a/app/db.py b/app/db.py
+new file mode 100644
+index 0000000..d951bae
+--- /dev/null
++++ b/app/db.py
+@@ -0,0 +1,137 @@
++"""Database access layer.
++
++This replaces Flask-SQLAlchemy with plain SQLAlchemy. The scoped session is
++tied to a context variable that the request context middleware refreshes on
++every request, so each request works with its own session, exactly like the
++session that Flask-SQLAlchemy attached to the application context.
++"""
++from contextvars import ContextVar
++from math import ceil
++
++import sqlalchemy as sa
++import sqlalchemy.orm as so
++from starlette.exceptions import HTTPException
++
++_session_scope = ContextVar('microblog_db_session', default=None)
++
++
++class Model(so.DeclarativeBase):
++    """Base class for all the models of the application."""
++
++
++engine = None
++session_factory = so.sessionmaker()
++session = so.scoped_session(session_factory, scopefunc=_session_scope.get)
++
++metadata = Model.metadata
++
++
++def init_db(uri, engine_options=None):
++    """Create the engine and bind the session factory to it."""
++    global engine
++    options = dict(engine_options or {})
++    url = sa.engine.make_url(uri)
++    if url.get_backend_name() == 'sqlite':
++        if url.database in (None, '', ':memory:'):
++            # keep a single connection alive, or every session would get its
++            # own, empty, in-memory database
++            options.setdefault('poolclass', sa.pool.StaticPool)
++            options.setdefault('connect_args', {'check_same_thread': False})
++    engine = sa.create_engine(url, **options)
++    session_factory.configure(bind=engine)
++    return engine
++
++
++def new_session_scope():
++    """Start a new session scope, returning its reset token."""
++    return _session_scope.set(object())
++
++
++def reset_session_scope(token):
++    _session_scope.reset(token)
++
++
++def create_all():
++    Model.metadata.create_all(engine)
++
++
++def drop_all():
++    Model.metadata.drop_all(engine)
++
++
++class Pagination:
++    """The subset of the Flask-SQLAlchemy pagination object that is used."""
++
++    def __init__(self, select, page, per_page, error_out=True,
++                 max_per_page=None):
++        if page is None or (page < 1 and not error_out):
++            page = 1
++        if per_page is None or (per_page < 1 and not error_out):
++            per_page = 20
++        if error_out and (page < 1 or per_page < 1):
++            raise HTTPException(status_code=404)
++        if max_per_page is not None:
++            per_page = min(per_page, max_per_page)
++
++        self.page = page
++        self.per_page = per_page
++        self.max_per_page = max_per_page
++
++        items = session.execute(
++            select.limit(per_page).offset((page - 1) * per_page)
++        ).unique().scalars().all()
++        if not items and page != 1 and error_out:
++            raise HTTPException(status_code=404)
++        self.items = list(items)
++
++        sub = select.options(so.lazyload('*')).order_by(None).subquery()
++        self.total = session.execute(
++            sa.select(sa.func.count()).select_from(sub)).scalar()
++
++    @property
++    def pages(self):
++        if self.total == 0 or self.total is None:
++            return 0
++        return int(ceil(self.total / float(self.per_page)))
++
++    @property
++    def has_prev(self):
++        return self.page > 1
++
++    @property
++    def prev_num(self):
++        if not self.has_prev:
++            return None
++        return self.page - 1
++
++    @property
++    def has_next(self):
++        return self.page < self.pages
++
++    @property
++    def next_num(self):
++        if not self.has_next:
++            return None
++        return self.page + 1
++
++
++def paginate(select, page=None, per_page=None, max_per_page=None,
++             error_out=True):
++    return Pagination(select, page=page, per_page=per_page,
++                      max_per_page=max_per_page, error_out=error_out)
++
++
++def first_or_404(select, description=None):
++    """Return the first result of the query, or raise a 404 error."""
++    value = session.scalars(select).first()
++    if value is None:
++        raise HTTPException(status_code=404, detail=description)
++    return value
++
++
++def get_or_404(model, ident, description=None):
++    """Return the model instance with the given primary key, or raise a 404."""
++    value = session.get(model, ident)
++    if value is None:
++        raise HTTPException(status_code=404, detail=description)
++    return value
+diff --git a/app/email.py b/app/email.py
+index 2375cea..7fae5cc 100644
+--- a/app/email.py
++++ b/app/email.py
+@@ -1,24 +1,45 @@
++"""Sending of email messages, a replacement for Flask-Mail."""
++import smtplib
++from email.message import EmailMessage
+ from threading import Thread
+-from flask import current_app
+-from flask_mail import Message
+-from app import mail
+ 
++from app.state import state
+ 
+-def send_async_email(app, msg):
+-    with app.app_context():
+-        mail.send(msg)
++
++def send_async_email(config, msg):
++    _send_message(config, msg)
++
++
++def _send_message(config, msg):
++    server = smtplib.SMTP(config['MAIL_SERVER'], config['MAIL_PORT'])
++    try:
++        if config['MAIL_USE_TLS']:
++            server.starttls()
++        if config['MAIL_USERNAME'] or config['MAIL_PASSWORD']:
++            server.login(config['MAIL_USERNAME'], config['MAIL_PASSWORD'])
++        server.send_message(msg)
++    finally:
++        server.quit()
+ 
+ 
+ def send_email(subject, sender, recipients, text_body, html_body,
+                attachments=None, sync=False):
+-    msg = Message(subject, sender=sender, recipients=recipients)
+-    msg.body = text_body
+-    msg.html = html_body
++    msg = EmailMessage()
++    msg['Subject'] = subject
++    msg['From'] = sender
++    msg['To'] = ', '.join(recipients)
++    msg.set_content(text_body)
++    msg.add_alternative(html_body, subtype='html')
+     if attachments:
+         for attachment in attachments:
+-            msg.attach(*attachment)
++            filename, content_type, data = attachment
++            maintype, _, subtype = content_type.partition('/')
++            if isinstance(data, str):
++                data = data.encode('utf-8')
++            msg.add_attachment(data, maintype=maintype, subtype=subtype,
++                               filename=filename)
++    config = dict(state.config)
+     if sync:
+-        mail.send(msg)
++        _send_message(config, msg)
+     else:
+-        Thread(target=send_async_email,
+-               args=(current_app._get_current_object(), msg)).start()
++        Thread(target=send_async_email, args=(config, msg)).start()
+diff --git a/app/errors/__init__.py b/app/errors/__init__.py
+index 5701c1d..30864d3 100644
+--- a/app/errors/__init__.py
++++ b/app/errors/__init__.py
+@@ -1,5 +1,12 @@
+-from flask import Blueprint
++from starlette.exceptions import HTTPException
+ 
+-bp = Blueprint('errors', __name__)
++from app.login import AuthRedirect
+ 
+-from app.errors import handlers
++
++def register_error_handlers(app):
++    """Install the error handlers of the application."""
++    from app.errors import handlers
++
++    app.add_exception_handler(HTTPException, handlers.http_exception)
++    app.add_exception_handler(AuthRedirect, handlers.auth_redirect)
++    return app
+diff --git a/app/errors/handlers.py b/app/errors/handlers.py
+index 62d42ad..80407b4 100644
+--- a/app/errors/handlers.py
++++ b/app/errors/handlers.py
+@@ -1,24 +1,70 @@
+-from flask import render_template, request
++from starlette.responses import PlainTextResponse
++
+ from app import db
+-from app.errors import bp
+ from app.api.errors import error_response as api_error_response
++from app.responses import redirect
++from app.templating import render_template
++
++
++def _accept_quality(request, mimetype):
++    """Return the quality the client gives to a mime type."""
++    best = 0.0
++    for part in request.headers.get('accept', '').split(','):
++        part = part.strip()
++        if not part:
++            continue
++        pieces = part.split(';')
++        value = pieces[0].strip()
++        quality = 1.0
++        for piece in pieces[1:]:
++            piece = piece.strip()
++            if piece.startswith('q='):
++                try:
++                    quality = float(piece[2:])
++                except ValueError:
++                    quality = 0.0
++        if value == mimetype or value == '*/*' or \
++                (value.endswith('/*') and
++                 mimetype.startswith(value[:-1])):
++            best = max(best, quality)
++    return best
++
++
++def wants_json_response(request):
++    return _accept_quality(request, 'application/json') >= \
++        _accept_quality(request, 'text/html')
+ 
+ 
+-def wants_json_response():
+-    return request.accept_mimetypes['application/json'] >= \
+-        request.accept_mimetypes['text/html']
++def wants_api_response(request):
++    return request.url.path.startswith('/api')
+ 
+ 
+-@bp.app_errorhandler(404)
+-def not_found_error(error):
+-    if wants_json_response():
++async def not_found_error(request, error):
++    if wants_api_response(request) or wants_json_response(request):
+         return api_error_response(404)
+-    return render_template('errors/404.html'), 404
++    return render_template('errors/404.html', status_code=404)
+ 
+ 
+-@bp.app_errorhandler(500)
+-def internal_error(error):
++async def internal_error(request, error):
+     db.session.rollback()
+-    if wants_json_response():
++    if wants_api_response(request) or wants_json_response(request):
+         return api_error_response(500)
+-    return render_template('errors/500.html'), 500
++    return render_template('errors/500.html', status_code=500)
++
++
++async def http_exception(request, error):
++    """Handle the HTTP errors raised by the views."""
++    if error.status_code == 404:
++        return await not_found_error(request, error)
++    if error.status_code == 500:
++        return await internal_error(request, error)
++    if wants_api_response(request):
++        return api_error_response(error.status_code,
++                                  headers=getattr(error, 'headers', None))
++    return PlainTextResponse(error.detail, status_code=error.status_code,
++                             headers=getattr(error, 'headers', None))
++
++
++async def auth_redirect(request, error):
++    """Send anonymous users to the login page."""
++    return redirect(error.location)
+diff --git a/app/forms.py b/app/forms.py
+new file mode 100644
+index 0000000..493bdaf
+--- /dev/null
++++ b/app/forms.py
+@@ -0,0 +1,112 @@
++"""Base form class.
++
++Flask-WTF is replaced by WTForms itself. This base class adds the few
++conveniences that were used from Flask-WTF: forms populated from the request,
++``validate_on_submit()``, the ``hidden_tag()`` template helper, and CSRF
++protection backed by the session.
++"""
++import os
++from datetime import timedelta
++
++import wtforms
++from babel.support import Translations
++from markupsafe import Markup
++from wtforms import Form
++from wtforms.csrf.session import SessionCSRF
++from wtforms.meta import DefaultMeta
++from wtforms.validators import ValidationError
++from wtforms.widgets import HiddenInput
++
++from app.context import get_request, get_session
++from app.i18n import get_locale
++from app.state import state
++
++SUBMIT_METHODS = {'POST', 'PUT', 'PATCH', 'DELETE'}
++
++WTFORMS_TRANSLATION_DIRECTORY = os.path.join(
++    os.path.dirname(os.path.abspath(wtforms.__file__)), 'locale')
++
++_translations_cache = {}
++
++
++def get_wtforms_translations():
++    """Load the catalog that WTForms ships for the locale of the request.
++
++    Flask-WTF used to connect the built in messages of WTForms, such as "This
++    field is required.", to the translations of the application. Without this
++    they would always be rendered in English.
++    """
++    locale = get_locale()
++    key = str(locale)
++    translations = _translations_cache.get(key)
++    if translations is None:
++        translations = Translations.load(WTFORMS_TRANSLATION_DIRECTORY,
++                                         [locale], 'wtforms')
++        _translations_cache[key] = translations
++    return translations
++
++
++class SessionCSRFTokens(SessionCSRF):
++    """Session CSRF tokens that fail validation instead of raising."""
++
++    def validate_csrf_token(self, form, field):
++        if 'csrf' not in self.session:
++            raise ValidationError(field.gettext('CSRF token missing.'))
++        return super().validate_csrf_token(form, field)
++
++
++class FormMeta(DefaultMeta):
++    csrf = True
++    csrf_class = SessionCSRFTokens
++    csrf_time_limit = timedelta(minutes=30)
++
++    @property
++    def csrf_secret(self):
++        secret_key = state.config.get('SECRET_KEY') or ''
++        return secret_key.encode('utf-8') if isinstance(secret_key, str) \
++            else secret_key
++
++    @property
++    def csrf_context(self):
++        return get_session()
++
++    def get_translations(self, form):
++        return get_wtforms_translations()
++
++
++class BaseForm(Form):
++    """The base class of every form of the application."""
++
++    Meta = FormMeta
++
++    def __init__(self, *args, **kwargs):
++        self._request = kwargs.pop('request', None) or get_request()
++        super().__init__(*args, **kwargs)
++
++    @classmethod
++    async def from_formdata(cls, request=None, *args, **kwargs):
++        """Create a form, filled with the data submitted with the request."""
++        request = request or get_request()
++        if 'formdata' not in kwargs and request is not None and \
++                request.method in SUBMIT_METHODS:
++            kwargs['formdata'] = await request.form()
++        return cls(*args, request=request, **kwargs)
++
++    def is_submitted(self):
++        request = self._request
++        return request is not None and request.method in SUBMIT_METHODS
++
++    def validate_on_submit(self, extra_validators=None):
++        return self.is_submitted() and self.validate(
++            extra_validators=extra_validators)
++
++    def hidden_tag(self, *fields):
++        """Render the hidden fields of the form, the CSRF token included."""
++        if not fields:
++            fields = [field for field in self
++                      if isinstance(field.widget, HiddenInput)]
++        else:
++            fields = [self[field] if isinstance(field, str) else field
++                      for field in fields]
++        return Markup('<div style="display:none;">{}</div>'.format(
++            ''.join(str(field()) for field in fields)))
+diff --git a/app/i18n.py b/app/i18n.py
+new file mode 100644
+index 0000000..56d64c1
+--- /dev/null
++++ b/app/i18n.py
+@@ -0,0 +1,105 @@
++"""Internationalization support.
++
++Flask-Babel is replaced here by direct use of the Babel library. The locale of
++the current request is kept in a context variable that the request context
++middleware sets on every request.
++"""
++import os
++from contextvars import ContextVar
++
++from babel import Locale, negotiate_locale
++from babel.support import Translations, LazyProxy
++
++from app.state import state
++from app.context import get_request
++
++DEFAULT_LOCALE = 'en'
++TRANSLATION_DIRECTORY = os.path.join(
++    os.path.dirname(os.path.abspath(__file__)), 'translations')
++
++_locale_ctx = ContextVar('microblog_locale', default=None)
++_translations_cache = {}
++
++
++def parse_accept_language(header):
++    """Return the languages of an Accept-Language header, best first."""
++    languages = []
++    for index, part in enumerate(header.split(',')):
++        part = part.strip()
++        if not part:
++            continue
++        pieces = part.split(';')
++        language = pieces[0].strip()
++        quality = 1.0
++        for piece in pieces[1:]:
++            piece = piece.strip()
++            if piece.startswith('q='):
++                try:
++                    quality = float(piece[2:])
++                except ValueError:
++                    quality = 0.0
++        languages.append((language, quality, index))
++    languages.sort(key=lambda item: (-item[1], item[2]))
++    return [language for language, quality, index in languages if quality > 0]
++
++
++def select_locale():
++    """Pick the best supported locale for the current request."""
++    languages = list(state.config.get('LANGUAGES') or [DEFAULT_LOCALE])
++    request = get_request()
++    if request is not None:
++        preferred = parse_accept_language(
++            request.headers.get('accept-language', ''))
++        matched = negotiate_locale(preferred, languages, sep='-')
++        if matched:
++            return Locale.parse(matched, sep='-')
++    return Locale.parse(languages[0] if languages else DEFAULT_LOCALE, sep='-')
++
++
++def set_locale(locale):
++    """Bind a locale to the current context, returning the reset token."""
++    return _locale_ctx.set(locale)
++
++
++def reset_locale(token):
++    _locale_ctx.reset(token)
++
++
++def get_locale():
++    """Return the locale in use, selecting one if it has not been set yet."""
++    locale = _locale_ctx.get()
++    if locale is None:
++        locale = select_locale()
++        _locale_ctx.set(locale)
++    return locale
++
++
++def get_translations():
++    locale = get_locale()
++    key = str(locale)
++    translations = _translations_cache.get(key)
++    if translations is None:
++        translations = Translations.load(TRANSLATION_DIRECTORY, [locale],
++                                         'messages')
++        _translations_cache[key] = translations
++    return translations
++
++
++def gettext(string, **variables):
++    translated = get_translations().gettext(string)
++    return translated % variables if variables else translated
++
++
++def ngettext(singular, plural, num, **variables):
++    variables.setdefault('num', num)
++    translated = get_translations().ngettext(singular, plural, num)
++    return translated % variables
++
++
++def lazy_gettext(string, **variables):
++    """A version of ``gettext()`` that is evaluated when it is rendered."""
++    return LazyProxy(gettext, string, enable_cache=False, **variables)
++
++
++_ = gettext
++_l = lazy_gettext
+diff --git a/app/login.py b/app/login.py
+new file mode 100644
+index 0000000..4363e44
+--- /dev/null
++++ b/app/login.py
+@@ -0,0 +1,201 @@
++"""User sessions.
++
++This module provides the parts of Flask-Login that the application used: the
++``current_user`` proxy, the functions that log users in and out, and the
++dependency that protects the views that require an authenticated user.
++"""
++from contextvars import ContextVar
++
++from app.context import get_session, flash, get_request
++
++USER_ID_KEY = '_user_id'
++REMEMBER_KEY = '_remember'
++
++_current_user_ctx = ContextVar('microblog_current_user', default=None)
++
++
++class UserMixin:
++    """Default implementations of the properties expected from a user."""
++
++    @property
++    def is_authenticated(self):
++        return True
++
++    @property
++    def is_active(self):
++        return True
++
++    @property
++    def is_anonymous(self):
++        return False
++
++    def get_id(self):
++        return str(self.id)
++
++
++class AnonymousUser:
++    """The user of a request that does not have anybody logged in."""
++
++    @property
++    def is_authenticated(self):
++        return False
++
++    @property
++    def is_active(self):
++        return False
++
++    @property
++    def is_anonymous(self):
++        return True
++
++    def get_id(self):
++        return None
++
++    def __repr__(self):
++        return '<AnonymousUser>'
++
++
++class AuthRedirect(Exception):
++    """Raised when an anonymous user requests a page that needs a login."""
++
++    def __init__(self, location):
++        super().__init__(location)
++        self.location = location
++
++
++class LoginManager:
++    """Keeps the user loader and the settings of the login redirect."""
++
++    def __init__(self):
++        self.login_view = None
++        self.login_message = None
++        self.anonymous_user = AnonymousUser
++        self._user_callback = None
++
++    def user_loader(self, callback):
++        self._user_callback = callback
++        return callback
++
++    def load_user(self, user_id):
++        if self._user_callback is None:
++            raise RuntimeError('No user loader has been installed.')
++        return self._user_callback(user_id)
++
++
++login = LoginManager()
++
++
++def set_current_user(user):
++    """Bind a user to the current context, returning the reset token."""
++    return _current_user_ctx.set(user)
++
++
++def reset_current_user(token):
++    _current_user_ctx.reset(token)
++
++
++def get_current_user():
++    user = _current_user_ctx.get()
++    if user is None:
++        user = login.anonymous_user()
++        _current_user_ctx.set(user)
++    return user
++
++
++def load_user_from_session():
++    """Restore the logged in user of the current request from its session."""
++    user = None
++    user_id = get_session().get(USER_ID_KEY)
++    if user_id is not None:
++        try:
++            user = login.load_user(user_id)
++        except (TypeError, ValueError):
++            user = None
++    if user is None:
++        user = login.anonymous_user()
++    return set_current_user(user)
++
++
++class CurrentUserProxy:
++    """Proxy that forwards everything to the user of the current request."""
++
++    __slots__ = ()
++
++    @property
++    def __class__(self):
++        return type(get_current_user())
++
++    def _get_current_object(self):
++        return get_current_user()
++
++    def __getattr__(self, name):
++        return getattr(get_current_user(), name)
++
++    def __setattr__(self, name, value):
++        setattr(get_current_user(), name, value)
++
++    def __delattr__(self, name):
++        delattr(get_current_user(), name)
++
++    def __eq__(self, other):
++        if isinstance(other, CurrentUserProxy):
++            other = other._get_current_object()
++        return get_current_user() == other
++
++    def __ne__(self, other):
++        return not self.__eq__(other)
++
++    def __hash__(self):
++        return hash(get_current_user())
++
++    def __bool__(self):
++        return bool(get_current_user())
++
++    def __repr__(self):
++        return repr(get_current_user())
++
++
++current_user = CurrentUserProxy()
++
++
++def login_user(user, remember=False):
++    """Log a user in, storing its identity in the session."""
++    session = get_session()
++    session[USER_ID_KEY] = user.get_id()
++    session[REMEMBER_KEY] = bool(remember)
++    set_current_user(user)
++    return True
++
++
++def logout_user():
++    """Log the current user out."""
++    session = get_session()
++    session.pop(USER_ID_KEY, None)
++    session.pop(REMEMBER_KEY, None)
++    set_current_user(login.anonymous_user())
++    return True
++
++
++def make_next_param():
++    """Return the path of the current request, to return to it after login."""
++    request = get_request()
++    if request is None:
++        return None
++    next_param = request.url.path
++    if request.url.query:
++        next_param = f'{next_param}?{request.url.query}'
++    return next_param
++
++
++async def login_required():
++    """Dependency that only lets authenticated users through."""
++    from app.urls import url_for
++
++    user = get_current_user()
++    if not user.is_authenticated:
++        if login.login_message:
++            flash(login.login_message)
++        next_param = make_next_param()
++        values = {'next': next_param} if next_param else {}
++        raise AuthRedirect(url_for(login.login_view, **values))
++    return user
+diff --git a/app/main/__init__.py b/app/main/__init__.py
+index 3b580b0..64d231d 100644
+--- a/app/main/__init__.py
++++ b/app/main/__init__.py
+@@ -1,5 +1,5 @@
+-from flask import Blueprint
++from fastapi import APIRouter
+ 
+-bp = Blueprint('main', __name__)
++bp = APIRouter()
+ 
+ from app.main import routes
+diff --git a/app/main/forms.py b/app/main/forms.py
+index 132a299..437a894 100644
+--- a/app/main/forms.py
++++ b/app/main/forms.py
+@@ -1,14 +1,15 @@
+-from flask import request
+-from flask_wtf import FlaskForm
+ from wtforms import StringField, SubmitField, TextAreaField
+ from wtforms.validators import ValidationError, DataRequired, Length
+ import sqlalchemy as sa
+-from flask_babel import _, lazy_gettext as _l
++
+ from app import db
++from app.context import get_request
++from app.forms import BaseForm
++from app.i18n import _, lazy_gettext as _l
+ from app.models import User
+ 
+ 
+-class EditProfileForm(FlaskForm):
++class EditProfileForm(BaseForm):
+     username = StringField(_l('Username'), validators=[DataRequired()])
+     about_me = TextAreaField(_l('About me'),
+                              validators=[Length(min=0, max=140)])
+@@ -26,28 +27,29 @@ class EditProfileForm(FlaskForm):
+                 raise ValidationError(_('Please use a different username.'))
+ 
+ 
+-class EmptyForm(FlaskForm):
++class EmptyForm(BaseForm):
+     submit = SubmitField('Submit')
+ 
+ 
+-class PostForm(FlaskForm):
++class PostForm(BaseForm):
+     post = TextAreaField(_l('Say something'), validators=[
+         DataRequired(), Length(min=1, max=140)])
+     submit = SubmitField(_l('Submit'))
+ 
+ 
+-class SearchForm(FlaskForm):
++class SearchForm(BaseForm):
+     q = StringField(_l('Search'), validators=[DataRequired()])
+ 
+     def __init__(self, *args, **kwargs):
+         if 'formdata' not in kwargs:
+-            kwargs['formdata'] = request.args
++            request = get_request()
++            kwargs['formdata'] = request.query_params if request else None
+         if 'meta' not in kwargs:
+             kwargs['meta'] = {'csrf': False}
+         super(SearchForm, self).__init__(*args, **kwargs)
+ 
+ 
+-class MessageForm(FlaskForm):
++class MessageForm(BaseForm):
+     message = TextAreaField(_l('Message'), validators=[
+         DataRequired(), Length(min=1, max=140)])
+     submit = SubmitField(_l('Submit'))
+diff --git a/app/main/routes.py b/app/main/routes.py
+index 103bbc7..c84c8c3 100644
+--- a/app/main/routes.py
++++ b/app/main/routes.py
+@@ -1,20 +1,28 @@
+ from datetime import datetime, timezone
+-from flask import render_template, flash, redirect, url_for, request, g, \
+-    current_app
+-from flask_login import current_user, login_required
+-from flask_babel import _, get_locale
++from fastapi import Depends, Request
+ import sqlalchemy as sa
+ from langdetect import detect, LangDetectException
++
+ from app import db
++from app.context import g, flash
++from app.i18n import _, get_locale
++from app.login import current_user, login_required
++from app.main import bp
+ from app.main.forms import EditProfileForm, EmptyForm, PostForm, SearchForm, \
+     MessageForm
+ from app.models import User, Post, Message, Notification
++from app.params import Page, Since
++from app.responses import redirect
++from app.state import state
++from app.templating import render_template
+ from app.translate import translate
+-from app.main import bp
++from app.urls import url_for
++
++authenticated = [Depends(login_required)]
+ 
+ 
+-@bp.before_app_request
+ def before_request():
++    """Run before every request, from the request context middleware."""
+     if current_user.is_authenticated:
+         current_user.last_seen = datetime.now(timezone.utc)
+         db.session.commit()
+@@ -22,25 +30,26 @@ def before_request():
+     g.locale = str(get_locale())
+ 
+ 
+-@bp.route('/', methods=['GET', 'POST'])
+-@bp.route('/index', methods=['GET', 'POST'])
+-@login_required
+-def index():
+-    form = PostForm()
++@bp.api_route('/index', methods=['GET', 'POST'], name='main.index',
++              dependencies=authenticated)
++@bp.api_route('/', methods=['GET', 'POST'], name='main.index',
++              dependencies=authenticated)
++async def index(request: Request, page: Page = 1):
++    form = await PostForm.from_formdata(request)
+     if form.validate_on_submit():
+         try:
+             language = detect(form.post.data)
+         except LangDetectException:
+             language = ''
+-        post = Post(body=form.post.data, author=current_user,
++        post = Post(body=form.post.data,
++                    author=current_user._get_current_object(),
+                     language=language)
+         db.session.add(post)
+         db.session.commit()
+         flash(_('Your post is now live!'))
+         return redirect(url_for('main.index'))
+-    page = request.args.get('page', 1, type=int)
+     posts = db.paginate(current_user.following_posts(), page=page,
+-                        per_page=current_app.config['POSTS_PER_PAGE'],
++                        per_page=state.config['POSTS_PER_PAGE'],
+                         error_out=False)
+     next_url = url_for('main.index', page=posts.next_num) \
+         if posts.has_next else None
+@@ -51,13 +60,11 @@ def index():
+                            prev_url=prev_url)
+ 
+ 
+-@bp.route('/explore')
+-@login_required
+-def explore():
+-    page = request.args.get('page', 1, type=int)
++@bp.get('/explore', name='main.explore', dependencies=authenticated)
++async def explore(page: Page = 1):
+     query = sa.select(Post).order_by(Post.timestamp.desc())
+     posts = db.paginate(query, page=page,
+-                        per_page=current_app.config['POSTS_PER_PAGE'],
++                        per_page=state.config['POSTS_PER_PAGE'],
+                         error_out=False)
+     next_url = url_for('main.explore', page=posts.next_num) \
+         if posts.has_next else None
+@@ -68,14 +75,12 @@ def explore():
+                            prev_url=prev_url)
+ 
+ 
+-@bp.route('/user/<username>')
+-@login_required
+-def user(username):
++@bp.get('/user/{username}', name='main.user', dependencies=authenticated)
++async def user(username: str, page: Page = 1):
+     user = db.first_or_404(sa.select(User).where(User.username == username))
+-    page = request.args.get('page', 1, type=int)
+     query = user.posts.select().order_by(Post.timestamp.desc())
+     posts = db.paginate(query, page=page,
+-                        per_page=current_app.config['POSTS_PER_PAGE'],
++                        per_page=state.config['POSTS_PER_PAGE'],
+                         error_out=False)
+     next_url = url_for('main.user', username=user.username,
+                        page=posts.next_num) if posts.has_next else None
+@@ -86,18 +91,19 @@ def user(username):
+                            next_url=next_url, prev_url=prev_url, form=form)
+ 
+ 
+-@bp.route('/user/<username>/popup')
+-@login_required
+-def user_popup(username):
++@bp.get('/user/{username}/popup', name='main.user_popup',
++        dependencies=authenticated)
++async def user_popup(username: str):
+     user = db.first_or_404(sa.select(User).where(User.username == username))
+     form = EmptyForm()
+     return render_template('user_popup.html', user=user, form=form)
+ 
+ 
+-@bp.route('/edit_profile', methods=['GET', 'POST'])
+-@login_required
+-def edit_profile():
+-    form = EditProfileForm(current_user.username)
++@bp.api_route('/edit_profile', methods=['GET', 'POST'],
++              name='main.edit_profile', dependencies=authenticated)
++async def edit_profile(request: Request):
++    form = await EditProfileForm.from_formdata(request,
++                                               current_user.username)
+     if form.validate_on_submit():
+         current_user.username = form.username.data
+         current_user.about_me = form.about_me.data
+@@ -111,10 +117,9 @@ def edit_profile():
+                            form=form)
+ 
+ 
+-@bp.route('/follow/<username>', methods=['POST'])
+-@login_required
+-def follow(username):
+-    form = EmptyForm()
++@bp.post('/follow/{username}', name='main.follow', dependencies=authenticated)
++async def follow(username: str, request: Request):
++    form = await EmptyForm.from_formdata(request)
+     if form.validate_on_submit():
+         user = db.session.scalar(
+             sa.select(User).where(User.username == username))
+@@ -132,10 +137,10 @@ def follow(username):
+         return redirect(url_for('main.index'))
+ 
+ 
+-@bp.route('/unfollow/<username>', methods=['POST'])
+-@login_required
+-def unfollow(username):
+-    form = EmptyForm()
++@bp.post('/unfollow/{username}', name='main.unfollow',
++         dependencies=authenticated)
++async def unfollow(username: str, request: Request):
++    form = await EmptyForm.from_formdata(request)
+     if form.validate_on_submit():
+         user = db.session.scalar(
+             sa.select(User).where(User.username == username))
+@@ -153,39 +158,37 @@ def unfollow(username):
+         return redirect(url_for('main.index'))
+ 
+ 
+-@bp.route('/translate', methods=['POST'])
+-@login_required
+-def translate_text():
+-    data = request.get_json()
++@bp.post('/translate', name='main.translate_text',
++         dependencies=authenticated)
++async def translate_text(request: Request):
++    data = await request.json()
+     return {'text': translate(data['text'],
+                               data['source_language'],
+                               data['dest_language'])}
+ 
+ 
+-@bp.route('/search')
+-@login_required
+-def search():
++@bp.get('/search', name='main.search', dependencies=authenticated)
++async def search(page: Page = 1):
+     if not g.search_form.validate():
+         return redirect(url_for('main.explore'))
+-    page = request.args.get('page', 1, type=int)
+     posts, total = Post.search(g.search_form.q.data, page,
+-                               current_app.config['POSTS_PER_PAGE'])
++                               state.config['POSTS_PER_PAGE'])
+     next_url = url_for('main.search', q=g.search_form.q.data, page=page + 1) \
+-        if total > page * current_app.config['POSTS_PER_PAGE'] else None
++        if total > page * state.config['POSTS_PER_PAGE'] else None
+     prev_url = url_for('main.search', q=g.search_form.q.data, page=page - 1) \
+         if page > 1 else None
+     return render_template('search.html', title=_('Search'), posts=posts,
+                            next_url=next_url, prev_url=prev_url)
+ 
+ 
+-@bp.route('/send_message/<recipient>', methods=['GET', 'POST'])
+-@login_required
+-def send_message(recipient):
++@bp.api_route('/send_message/{recipient}', methods=['GET', 'POST'],
++              name='main.send_message', dependencies=authenticated)
++async def send_message(recipient: str, request: Request):
+     user = db.first_or_404(sa.select(User).where(User.username == recipient))
+-    form = MessageForm()
++    form = await MessageForm.from_formdata(request)
+     if form.validate_on_submit():
+-        msg = Message(author=current_user, recipient=user,
+-                      body=form.message.data)
++        msg = Message(author=current_user._get_current_object(),
++                      recipient=user, body=form.message.data)
+         db.session.add(msg)
+         user.add_notification('unread_message_count',
+                               user.unread_message_count())
+@@ -196,17 +199,15 @@ def send_message(recipient):
+                            form=form, recipient=recipient)
+ 
+ 
+-@bp.route('/messages')
+-@login_required
+-def messages():
++@bp.get('/messages', name='main.messages', dependencies=authenticated)
++async def messages(page: Page = 1):
+     current_user.last_message_read_time = datetime.now(timezone.utc)
+     current_user.add_notification('unread_message_count', 0)
+     db.session.commit()
+-    page = request.args.get('page', 1, type=int)
+     query = current_user.messages_received.select().order_by(
+         Message.timestamp.desc())
+     messages = db.paginate(query, page=page,
+-                           per_page=current_app.config['POSTS_PER_PAGE'],
++                           per_page=state.config['POSTS_PER_PAGE'],
+                            error_out=False)
+     next_url = url_for('main.messages', page=messages.next_num) \
+         if messages.has_next else None
+@@ -216,9 +217,8 @@ def messages():
+                            next_url=next_url, prev_url=prev_url)
+ 
+ 
+-@bp.route('/export_posts')
+-@login_required
+-def export_posts():
++@bp.get('/export_posts', name='main.export_posts', dependencies=authenticated)
++async def export_posts():
+     if current_user.get_task_in_progress('export_posts'):
+         flash(_('An export task is currently in progress'))
+     else:
+@@ -227,10 +227,9 @@ def export_posts():
+     return redirect(url_for('main.user', username=current_user.username))
+ 
+ 
+-@bp.route('/notifications')
+-@login_required
+-def notifications():
+-    since = request.args.get('since', 0.0, type=float)
++@bp.get('/notifications', name='main.notifications',
++        dependencies=authenticated)
++async def notifications(since: Since = 0.0):
+     query = current_user.notifications.select().where(
+         Notification.timestamp > since).order_by(Notification.timestamp.asc())
+     notifications = db.session.scalars(query)
+diff --git a/app/middleware.py b/app/middleware.py
+new file mode 100644
+index 0000000..a978155
+--- /dev/null
++++ b/app/middleware.py
+@@ -0,0 +1,58 @@
++"""Request context middleware.
++
++Everything that Flask used to set up in the request context is prepared here:
++the request itself, the ``g`` namespace, the database session, the locale and
++the logged in user. It also takes the role of Flask's ``before_request`` hook
++and of its handler for unexpected errors.
++"""
++from starlette.requests import Request
++
++from app import db
++from app.context import set_request, reset_request
++from app.i18n import set_locale, reset_locale, select_locale
++from app.login import reset_current_user, load_user_from_session
++from app.state import state
++
++
++class RequestContextMiddleware:
++    def __init__(self, app, before_request=None, error_handler=None):
++        self.app = app
++        self.before_request = before_request
++        self.error_handler = error_handler
++
++    async def __call__(self, scope, receive, send):
++        if scope['type'] != 'http':
++            await self.app(scope, receive, send)
++            return
++
++        request = Request(scope, receive)
++        request_tokens = set_request(request)
++        session_token = db.new_session_scope()
++        locale_token = set_locale(select_locale())
++        user_token = load_user_from_session()
++
++        response_started = False
++
++        async def send_wrapper(message):
++            nonlocal response_started
++            if message['type'] == 'http.response.start':
++                response_started = True
++            await send(message)
++
++        try:
++            if self.before_request is not None:
++                self.before_request()
++            await self.app(scope, receive, send_wrapper)
++        except Exception as exc:
++            state.logger.error('Exception on %s [%s]', request.url.path,
++                               request.method, exc_info=exc)
++            if self.error_handler is None or response_started:
++                raise
++            response = await self.error_handler(request, exc)
++            await response(scope, receive, send)
++        finally:
++            db.session.remove()
++            reset_current_user(user_token)
++            reset_locale(locale_token)
++            db.reset_session_scope(session_token)
++            reset_request(request_tokens)
+diff --git a/app/models.py b/app/models.py
+index db447d8..9a35a84 100644
+--- a/app/models.py
++++ b/app/models.py
+@@ -6,14 +6,15 @@ from time import time
+ from typing import Optional
+ import sqlalchemy as sa
+ import sqlalchemy.orm as so
+-from flask import current_app, url_for
+-from flask_login import UserMixin
+-from werkzeug.security import generate_password_hash, check_password_hash
+ import jwt
+ import redis
+ import rq
+-from app import db, login
++from app import db
++from app.login import UserMixin, login
+ from app.search import add_to_index, remove_from_index, query_index
++from app.security import generate_password_hash, check_password_hash
++from app.state import state
++from app.urls import url_for
+ 
+ 
+ class SearchableMixin:
+@@ -26,7 +27,7 @@ class SearchableMixin:
+         for i in range(len(ids)):
+             when.append((ids[i], i))
+         query = sa.select(cls).where(cls.id.in_(ids)).order_by(
+-            db.case(*when, value=cls.id))
++            sa.case(*when, value=cls.id))
+         return db.session.scalars(query), total
+ 
+     @classmethod
+@@ -56,8 +57,8 @@ class SearchableMixin:
+             add_to_index(cls.__tablename__, obj)
+ 
+ 
+-db.event.listen(db.session, 'before_commit', SearchableMixin.before_commit)
+-db.event.listen(db.session, 'after_commit', SearchableMixin.after_commit)
++sa.event.listen(db.session, 'before_commit', SearchableMixin.before_commit)
++sa.event.listen(db.session, 'after_commit', SearchableMixin.after_commit)
+ 
+ 
+ class PaginatedAPIMixin(object):
+@@ -87,7 +88,7 @@ class PaginatedAPIMixin(object):
+ 
+ followers = sa.Table(
+     'followers',
+-    db.metadata,
++    db.Model.metadata,
+     sa.Column('follower_id', sa.Integer, sa.ForeignKey('user.id'),
+               primary_key=True),
+     sa.Column('followed_id', sa.Integer, sa.ForeignKey('user.id'),
+@@ -96,6 +97,8 @@ followers = sa.Table(
+ 
+ 
+ class User(PaginatedAPIMixin, UserMixin, db.Model):
++    __tablename__ = 'user'
++
+     id: so.Mapped[int] = so.mapped_column(primary_key=True)
+     username: so.Mapped[str] = so.mapped_column(sa.String(64), index=True,
+                                                 unique=True)
+@@ -181,12 +184,12 @@ class User(PaginatedAPIMixin, UserMixin, db.Model):
+     def get_reset_password_token(self, expires_in=600):
+         return jwt.encode(
+             {'reset_password': self.id, 'exp': time() + expires_in},
+-            current_app.config['SECRET_KEY'], algorithm='HS256')
++            state.config['SECRET_KEY'], algorithm='HS256')
+ 
+     @staticmethod
+     def verify_reset_password_token(token):
+         try:
+-            id = jwt.decode(token, current_app.config['SECRET_KEY'],
++            id = jwt.decode(token, state.config['SECRET_KEY'],
+                             algorithms=['HS256'])['reset_password']
+         except Exception:
+             return
+@@ -207,8 +210,8 @@ class User(PaginatedAPIMixin, UserMixin, db.Model):
+         return n
+ 
+     def launch_task(self, name, description, *args, **kwargs):
+-        rq_job = current_app.task_queue.enqueue(f'app.tasks.{name}', self.id,
+-                                                *args, **kwargs)
++        rq_job = state.task_queue.enqueue(f'app.tasks.{name}', self.id,
++                                          *args, **kwargs)
+         task = Task(id=rq_job.get_id(), name=name, description=description,
+                     user=self)
+         db.session.add(task)
+@@ -285,7 +288,9 @@ def load_user(id):
+ 
+ 
+ class Post(SearchableMixin, db.Model):
++    __tablename__ = 'post'
+     __searchable__ = ['body']
++
+     id: so.Mapped[int] = so.mapped_column(primary_key=True)
+     body: so.Mapped[str] = so.mapped_column(sa.String(140))
+     timestamp: so.Mapped[datetime] = so.mapped_column(
+@@ -301,6 +306,8 @@ class Post(SearchableMixin, db.Model):
+ 
+ 
+ class Message(db.Model):
++    __tablename__ = 'message'
++
+     id: so.Mapped[int] = so.mapped_column(primary_key=True)
+     sender_id: so.Mapped[int] = so.mapped_column(sa.ForeignKey(User.id),
+                                                  index=True)
+@@ -322,6 +329,8 @@ class Message(db.Model):
+ 
+ 
+ class Notification(db.Model):
++    __tablename__ = 'notification'
++
+     id: so.Mapped[int] = so.mapped_column(primary_key=True)
+     name: so.Mapped[str] = so.mapped_column(sa.String(128), index=True)
+     user_id: so.Mapped[int] = so.mapped_column(sa.ForeignKey(User.id),
+@@ -336,6 +345,8 @@ class Notification(db.Model):
+ 
+ 
+ class Task(db.Model):
++    __tablename__ = 'task'
++
+     id: so.Mapped[str] = so.mapped_column(sa.String(36), primary_key=True)
+     name: so.Mapped[str] = so.mapped_column(sa.String(128), index=True)
+     description: so.Mapped[Optional[str]] = so.mapped_column(sa.String(128))
+@@ -346,7 +357,7 @@ class Task(db.Model):
+ 
+     def get_rq_job(self):
+         try:
+-            rq_job = rq.job.Job.fetch(self.id, connection=current_app.redis)
++            rq_job = rq.job.Job.fetch(self.id, connection=state.redis)
+         except (redis.exceptions.RedisError, rq.exceptions.NoSuchJobError):
+             return None
+         return rq_job
+diff --git a/app/moment.py b/app/moment.py
+new file mode 100644
+index 0000000..db3bff7
+--- /dev/null
++++ b/app/moment.py
+@@ -0,0 +1,140 @@
++"""Rendering of timestamps with moment.js, a port of the Flask-Moment helper.
++
++The ``moment`` object is exposed to the templates, where timestamps are
++rendered inside a hidden span that the accompanying JavaScript formats on the
++browser, in the local time zone of the visitor.
++"""
++from markupsafe import Markup
++
++default_moment_version = '2.29.4'
++default_moment_sri = ('sha512-42PE0rd+wZ2hNXftlM78BSehIGzezNeQuzihiBCvUEB3CVx'
++                      'HvsShF86wBWwQORNxNINlBPuq7rG4WWhNiTVHFg==')
++
++
++class moment:
++    """Render a timestamp with moment.js."""
++
++    @staticmethod
++    def include_moment(version=default_moment_version, local_js=None,
++                       no_js=None, sri=None):
++        js = ''
++        if not no_js:
++            if local_js is not None:
++                if not sri:
++                    js = f'<script src="{local_js}"></script>\n'
++                else:
++                    js = (f'<script src="{local_js}" integrity="{sri}" '
++                          'crossorigin="anonymous"></script>\n')
++            elif version is not None:
++                js_filename = 'moment-with-locales.min.js'
++                if not sri and version == default_moment_version:
++                    sri = default_moment_sri
++                url = ('https://cdnjs.cloudflare.com/ajax/libs/moment.js/'
++                       f'{version}/{js_filename}')
++                if sri:
++                    js = (f'<script src="{url}" integrity="{sri}" '
++                          'crossorigin="anonymous"></script>\n')
++                else:
++                    js = f'<script src="{url}"></script>\n'
++        return Markup(js + '''<script>
++function moment_render(elem) {
++  const timestamp = moment(elem.dataset.timestamp);
++  const func = elem.dataset.function;
++  const format = elem.dataset.format;
++  const timestamp2 = elem.dataset.timestamp2;
++  const no_suffix = elem.dataset.nosuffix;
++  const units = elem.dataset.units;
++  let args = [];
++  if (format) args.push(format);
++  if (timestamp2) args.push(moment(timestamp2));
++  if (no_suffix) args.push(no_suffix);
++  if (units) args.push(units);
++  elem.textContent = timestamp[func].apply(timestamp, args);
++  elem.style.display = "";
++}
++function moment_render_all() {
++  const moments = document.querySelectorAll(".dynamic-moment");
++  moments.forEach(function(moment) {
++    moment_render(moment);
++    const refresh = moment.dataset.refresh;
++    if (refresh && refresh > 0) {
++      (function(elem, interval) {
++        setInterval(function() { moment_render(elem); }, interval);
++      })(moment, refresh);
++    }
++  });
++}
++document.addEventListener("DOMContentLoaded", moment_render_all);
++</script>''')
++
++    @staticmethod
++    def locale(language='en', auto_detect=False, customization=None):
++        if auto_detect:
++            return Markup('<script>\nvar locale = '
++                          'window.navigator.userLanguage || '
++                          'window.navigator.language;\n'
++                          'moment.locale(locale);\nmoment_render_all();\n'
++                          '</script>')
++        if customization is not None:
++            return Markup(f'<script>\nmoment.locale("{language}", '
++                          f'{customization});\nmoment_render_all();\n'
++                          '</script>')
++        return Markup(f'<script>\nmoment.locale("{language}");\n'
++                      'moment_render_all();\n</script>')
++
++    lang = locale
++
++    def __init__(self, timestamp=None, local=False):
++        if timestamp is None:
++            timestamp = self._timestamp_as_iso_8601(self._now())
++        self.timestamp = timestamp
++        self.local = local
++
++    @staticmethod
++    def _now():
++        from datetime import datetime, timezone
++        return datetime.now(timezone.utc)
++
++    @staticmethod
++    def _timestamp_as_iso_8601(timestamp):
++        return timestamp.strftime('%Y-%m-%dT%H:%M:%SZ')
++
++    def _render(self, func, format=None, timestamp2=None, no_suffix=None,
++                units=None, refresh=False):
++        timestamp = self.timestamp
++        if not isinstance(timestamp, str):
++            timestamp = self._timestamp_as_iso_8601(timestamp)
++        attributes = f'data-function="{func}"'
++        if format:
++            attributes += f' data-format="{format}"'
++        if timestamp2:
++            attributes += f' data-timestamp2="{timestamp2}"'
++        if no_suffix:
++            attributes += f' data-nosuffix="{int(no_suffix)}"'
++        if units:
++            attributes += f' data-units="{units}"'
++        return Markup(f'<span class="dynamic-moment" '
++                      f'data-timestamp="{timestamp}" {attributes} '
++                      f'data-refresh="{int(refresh) * 60000}" '
++                      f'style="display: none">{timestamp}</span>')
++
++    def format(self, fmt=None, refresh=False):
++        return self._render('format', format=(fmt or ''), refresh=refresh)
++
++    def fromNow(self, no_suffix=False, refresh=False):
++        return self._render('fromNow', no_suffix=int(no_suffix),
++                            refresh=refresh)
++
++    def fromTime(self, timestamp, no_suffix=False, refresh=False):
++        return self._render(
++            'from', timestamp2=self._timestamp_as_iso_8601(timestamp),
++            no_suffix=int(no_suffix), refresh=refresh)
++
++    def calendar(self, refresh=False):
++        return self._render('calendar', refresh=refresh)
++
++    def valueOf(self, refresh=False):
++        return self._render('valueOf', refresh=refresh)
++
++    def unix(self, refresh=False):
++        return self._render('unix', refresh=refresh)
+diff --git a/app/params.py b/app/params.py
+new file mode 100644
+index 0000000..ba3f988
+--- /dev/null
++++ b/app/params.py
+@@ -0,0 +1,27 @@
++"""Query string parameters.
++
++``request.args.get(name, default, type=int)`` ignored the values it could not
++convert and returned the default, while FastAPI rejects the request with a
++validation error. These annotated types restore the lenient behaviour of the
++Flask version, so that a hand written URL such as ``/explore?page=x`` shows the
++first page instead of an error.
++"""
++from typing import Annotated
++
++from pydantic import BeforeValidator
++
++
++def _lenient(converter, default):
++    def convert(value):
++        if value is None:
++            return default
++        try:
++            return converter(value)
++        except (TypeError, ValueError):
++            return default
++    return convert
++
++
++Page = Annotated[int, BeforeValidator(_lenient(int, 1))]
++PerPage = Annotated[int, BeforeValidator(_lenient(int, 10))]
++Since = Annotated[float, BeforeValidator(_lenient(float, 0.0))]
+diff --git a/app/responses.py b/app/responses.py
+new file mode 100644
+index 0000000..128bf94
+--- /dev/null
++++ b/app/responses.py
+@@ -0,0 +1,7 @@
++"""Response helpers."""
++from starlette.responses import RedirectResponse
++
++
++def redirect(location, code=302, headers=None):
++    """Return a response that redirects the client to the given location."""
++    return RedirectResponse(location, status_code=code, headers=headers)
+diff --git a/app/search.py b/app/search.py
+index 51c5c96..27265a7 100644
+--- a/app/search.py
++++ b/app/search.py
+@@ -1,25 +1,25 @@
+-from flask import current_app
++from app.state import state
+ 
+ 
+ def add_to_index(index, model):
+-    if not current_app.elasticsearch:
++    if not state.elasticsearch:
+         return
+     payload = {}
+     for field in model.__searchable__:
+         payload[field] = getattr(model, field)
+-    current_app.elasticsearch.index(index=index, id=model.id, document=payload)
++    state.elasticsearch.index(index=index, id=model.id, document=payload)
+ 
+ 
+ def remove_from_index(index, model):
+-    if not current_app.elasticsearch:
++    if not state.elasticsearch:
+         return
+-    current_app.elasticsearch.delete(index=index, id=model.id)
++    state.elasticsearch.delete(index=index, id=model.id)
+ 
+ 
+ def query_index(index, query, page, per_page):
+-    if not current_app.elasticsearch:
++    if not state.elasticsearch:
+         return [], 0
+-    search = current_app.elasticsearch.search(
++    search = state.elasticsearch.search(
+         index=index,
+         query={'multi_match': {'query': query, 'fields': ['*']}},
+         from_=(page - 1) * per_page,
+diff --git a/app/security.py b/app/security.py
+new file mode 100644
+index 0000000..94755b6
+--- /dev/null
++++ b/app/security.py
+@@ -0,0 +1,88 @@
++"""Password hashing.
++
++A replacement for ``werkzeug.security`` that keeps the same hash format, so
++the passwords that are already stored in the database remain valid.
++"""
++import hashlib
++import hmac
++import secrets
++
++SALT_CHARS = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
++# scrypt needs OpenSSL 1.1 or newer, pbkdf2 is used when it is not available
++DEFAULT_METHOD = 'scrypt' if hasattr(hashlib, 'scrypt') else 'pbkdf2:sha256'
++DEFAULT_PBKDF2_ITERATIONS = 600000
++
++
++def gen_salt(length=16):
++    """Generate a random string of the given length."""
++    if length <= 0:
++        raise ValueError('Salt length must be at least 1.')
++    return ''.join(secrets.choice(SALT_CHARS) for _ in range(length))
++
++
++def _hash_internal(method, salt, password):
++    method, *args = method.split(':')
++    salt_bytes = salt.encode()
++    password_bytes = password.encode()
++
++    if method == 'scrypt':
++        if not hasattr(hashlib, 'scrypt'):
++            raise NotImplementedError(
++                'This installation of Python does not support scrypt.')
++        if not args:
++            n = 2 ** 15
++            r = 8
++            p = 1
++        else:
++            try:
++                n, r, p = map(int, args)
++            except ValueError:
++                raise ValueError(
++                    'scrypt requires "n", "r", and "p".') from None
++        maxmem = 132 * n * r * p  # ideally 128, but some extra seems needed
++        return (
++            hashlib.scrypt(password_bytes, salt=salt_bytes, n=n, r=r, p=p,
++                           maxmem=maxmem, dklen=64).hex(),
++            f'scrypt:{n}:{r}:{p}',
++        )
++    elif method == 'pbkdf2':
++        if len(args) == 0:
++            hash_name = 'sha256'
++            iterations = DEFAULT_PBKDF2_ITERATIONS
++        elif len(args) == 1:
++            hash_name = args[0]
++            iterations = DEFAULT_PBKDF2_ITERATIONS
++        elif len(args) == 2:
++            hash_name = args[0]
++            iterations = int(args[1])
++        else:
++            raise ValueError('pbkdf2 takes 2 arguments.')
++        return (
++            hashlib.pbkdf2_hmac(hash_name, password_bytes, salt_bytes,
++                                iterations).hex(),
++            f'pbkdf2:{hash_name}:{iterations}',
++        )
++    else:
++        raise ValueError(f'Invalid hash method {method!r}.')
++
++
++def generate_password_hash(password, method=DEFAULT_METHOD, salt_length=16):
++    """Hash a password, returning it as ``method$salt$hash``."""
++    salt = gen_salt(salt_length)
++    hashed, actual_method = _hash_internal(method, salt, password)
++    return f'{actual_method}${salt}${hashed}'
++
++
++def check_password_hash(pwhash, password):
++    """Check a password against a hash made by generate_password_hash()."""
++    try:
++        method, salt, hashval = pwhash.split('$', 2)
++    except ValueError:
++        return False
++    if not method or not salt:
++        return False
++    try:
++        return hmac.compare_digest(_hash_internal(method, salt, password)[0],
++                                   hashval)
++    except ValueError:
++        return False
+diff --git a/app/session.py b/app/session.py
+new file mode 100644
+index 0000000..be85c7a
+--- /dev/null
++++ b/app/session.py
+@@ -0,0 +1,75 @@
++"""Signed cookie sessions.
++
++Based on Starlette's session middleware, with the addition of a per session
++cookie lifetime, which is what makes the "remember me" option of the login
++form work: sessions that are not remembered expire when the browser is closed.
++"""
++import json
++from base64 import b64decode, b64encode
++
++import itsdangerous
++from itsdangerous.exc import BadSignature
++from starlette.datastructures import MutableHeaders
++from starlette.requests import HTTPConnection
++
++REMEMBER_KEY = '_remember'
++
++
++class SessionMiddleware:
++    def __init__(self, app, secret_key, session_cookie='session',
++                 max_age=365 * 24 * 60 * 60, path='/', same_site='lax',
++                 https_only=False, domain=None):
++        self.app = app
++        self.signer = itsdangerous.TimestampSigner(str(secret_key))
++        self.session_cookie = session_cookie
++        self.max_age = max_age
++        self.path = path
++        self.security_flags = 'httponly; samesite=' + same_site
++        if https_only:
++            self.security_flags += '; secure'
++        if domain is not None:
++            self.security_flags += f'; domain={domain}'
++
++    async def __call__(self, scope, receive, send):
++        if scope['type'] not in ('http', 'websocket'):
++            await self.app(scope, receive, send)
++            return
++
++        connection = HTTPConnection(scope)
++        initial_session_was_empty = True
++
++        if self.session_cookie in connection.cookies:
++            data = connection.cookies[self.session_cookie].encode('utf-8')
++            try:
++                data = self.signer.unsign(data, max_age=self.max_age)
++                scope['session'] = json.loads(b64decode(data))
++                initial_session_was_empty = False
++            except BadSignature:
++                scope['session'] = {}
++        else:
++            scope['session'] = {}
++
++        async def send_wrapper(message):
++            if message['type'] == 'http.response.start':
++                if scope['session']:
++                    data = b64encode(json.dumps(scope['session']).encode(
++                        'utf-8'))
++                    data = self.signer.sign(data)
++                    max_age = ''
++                    if scope['session'].get(REMEMBER_KEY):
++                        max_age = f'Max-Age={self.max_age}; '
++                    headers = MutableHeaders(scope=message)
++                    header_value = (
++                        f'{self.session_cookie}={data.decode("utf-8")}; '
++                        f'path={self.path}; {max_age}{self.security_flags}')
++                    headers.append('Set-Cookie', header_value)
++                elif not initial_session_was_empty:
++                    headers = MutableHeaders(scope=message)
++                    header_value = (
++                        f'{self.session_cookie}=null; path={self.path}; '
++                        'expires=Thu, 01 Jan 1970 00:00:00 GMT; '
++                        f'{self.security_flags}')
++                    headers.append('Set-Cookie', header_value)
++            await send(message)
++
++        await self.app(scope, receive, send_wrapper)
+diff --git a/app/state.py b/app/state.py
+new file mode 100644
+index 0000000..f3a78cc
+--- /dev/null
++++ b/app/state.py
+@@ -0,0 +1,27 @@
++"""Application wide state.
++
++FastAPI has no equivalent of Flask's application context, so the objects that
++used to be reachable through ``current_app`` (the configuration, the
++Elasticsearch client, the Redis connection, the task queue and the logger) are
++kept in this single container, which is populated by ``create_app()``.
++"""
++import logging
++
++
++class AppState:
++    def __init__(self):
++        self.app = None
++        self.config = {}
++        self.elasticsearch = None
++        self.redis = None
++        self.task_queue = None
++        self.logger = logging.getLogger('microblog')
++
++    def init_config(self, config_class):
++        self.config.clear()
++        self.config.update({key: getattr(config_class, key)
++                            for key in dir(config_class) if key.isupper()})
++        return self.config
++
++
++state = AppState()
+diff --git a/app/tasks.py b/app/tasks.py
+index 356079e..384a652 100644
+--- a/app/tasks.py
++++ b/app/tasks.py
+@@ -2,14 +2,15 @@ import json
+ import sys
+ import time
+ import sqlalchemy as sa
+-from flask import render_template
+ from rq import get_current_job
++
+ from app import create_app, db
+-from app.models import User, Post, Task
+ from app.email import send_email
++from app.models import User, Post, Task
++from app.state import state
++from app.templating import render_to_string
+ 
+ app = create_app()
+-app.app_context().push()
+ 
+ 
+ def _set_task_progress(progress):
+@@ -43,14 +44,14 @@ def export_posts(user_id):
+ 
+         send_email(
+             '[Microblog] Your blog posts',
+-            sender=app.config['ADMINS'][0], recipients=[user.email],
+-            text_body=render_template('email/export_posts.txt', user=user),
+-            html_body=render_template('email/export_posts.html', user=user),
++            sender=state.config['ADMINS'][0], recipients=[user.email],
++            text_body=render_to_string('email/export_posts.txt', user=user),
++            html_body=render_to_string('email/export_posts.html', user=user),
+             attachments=[('posts.json', 'application/json',
+                           json.dumps({'posts': data}, indent=4))],
+             sync=True)
+     except Exception:
+         _set_task_progress(100)
+-        app.logger.error('Unhandled exception', exc_info=sys.exc_info())
++        state.logger.error('Unhandled exception', exc_info=sys.exc_info())
+     finally:
+         _set_task_progress(100)
+diff --git a/app/templates/base.html b/app/templates/base.html
+index 4eca8da..2f013be 100644
+--- a/app/templates/base.html
++++ b/app/templates/base.html
+@@ -97,7 +97,7 @@
+     <script>
+       async function translate(sourceElem, destElem, sourceLang, destLang) {
+         document.getElementById(destElem).innerHTML = 
+-          '<img src="{{ url_for('static', filename='loading.gif') }}">';
++          '<img src="{{ url_for('static', path='loading.gif') }}">';
+         const response = await fetch('/translate', {
+           method: 'POST',
+           headers: {'Content-Type': 'application/json; charset=utf-8'},
+@@ -134,7 +134,7 @@
+             if (popover && data) {
+               ev.target.popupLoaded = true;
+               popover.setContent({'.popover-body': data});
+-              flask_moment_render_all();
++              moment_render_all();
+             }
+           });
+         }
+diff --git a/app/templating.py b/app/templating.py
+new file mode 100644
+index 0000000..c39153a
+--- /dev/null
++++ b/app/templating.py
+@@ -0,0 +1,54 @@
++"""Template rendering.
++
++The Jinja environment is created here with the same globals that Flask and its
++extensions used to install, so the templates of the application did not need to
++be rewritten.
++"""
++import os
++
++from jinja2 import Environment, FileSystemLoader, select_autoescape
++from starlette.responses import HTMLResponse
++
++from app.context import g, get_flashed_messages
++from app.i18n import gettext, ngettext, get_locale
++from app.login import current_user
++from app.moment import moment
++from app.state import state
++from app.urls import url_for
++
++TEMPLATE_DIRECTORY = os.path.join(os.path.dirname(os.path.abspath(__file__)),
++                                  'templates')
++
++env = Environment(
++    loader=FileSystemLoader(TEMPLATE_DIRECTORY),
++    autoescape=select_autoescape(
++        enabled_extensions=('html', 'htm', 'xml'),
++        default_for_string=False, default=False),
++    trim_blocks=False,
++    lstrip_blocks=False,
++    extensions=['jinja2.ext.i18n'],
++)
++# the "new style" callables make the translated string a Markup object when
++# the template is autoescaped, so that the placeholders of a translation can
++# be given HTML fragments, as _post.html does
++env.install_gettext_callables(gettext, ngettext, newstyle=True)
++env.globals.update({
++    'url_for': url_for,
++    'get_flashed_messages': get_flashed_messages,
++    'current_user': current_user,
++    'g': g,
++    'moment': moment,
++    'config': state.config,
++    'get_locale': get_locale,
++})
++
++
++def render_to_string(template_name, **context):
++    """Render a template and return it as a string."""
++    return env.get_template(template_name).render(**context)
++
++
++def render_template(template_name, status_code=200, headers=None, **context):
++    """Render a template and return it as an HTML response."""
++    return HTMLResponse(render_to_string(template_name, **context),
++                        status_code=status_code, headers=headers)
+diff --git a/app/translate.py b/app/translate.py
+index b51a17a..259141e 100644
+--- a/app/translate.py
++++ b/app/translate.py
+@@ -1,14 +1,15 @@
+ import requests
+-from flask import current_app
+-from flask_babel import _
++
++from app.i18n import _
++from app.state import state
+ 
+ 
+ def translate(text, source_language, dest_language):
+-    if 'MS_TRANSLATOR_KEY' not in current_app.config or \
+-            not current_app.config['MS_TRANSLATOR_KEY']:
++    if 'MS_TRANSLATOR_KEY' not in state.config or \
++            not state.config['MS_TRANSLATOR_KEY']:
+         return _('Error: the translation service is not configured.')
+     auth = {
+-        'Ocp-Apim-Subscription-Key': current_app.config['MS_TRANSLATOR_KEY'],
++        'Ocp-Apim-Subscription-Key': state.config['MS_TRANSLATOR_KEY'],
+         'Ocp-Apim-Subscription-Region': 'westus'
+     }
+     r = requests.post(
+diff --git a/app/urls.py b/app/urls.py
+new file mode 100644
+index 0000000..b7794b5
+--- /dev/null
++++ b/app/urls.py
+@@ -0,0 +1,60 @@
++"""URL generation.
++
++``url_for()`` builds URLs from the name of a route, in the same way Flask did
++it from the name of a view function. Route names keep the ``blueprint.view``
++format used by the Flask version of the application, so templates and models
++did not have to change the endpoints they reference.
++"""
++from urllib.parse import urlencode, urljoin
++
++from starlette.routing import NoMatchFound
++
++from app.context import get_request
++from app.state import state
++
++
++def _find_route(endpoint):
++    for route in state.app.routes:
++        if getattr(route, 'name', None) == endpoint:
++            return route
++    return None
++
++
++def _base_url():
++    request = get_request()
++    if request is not None:
++        return str(request.base_url)
++    server_name = state.config.get('SERVER_NAME')
++    if not server_name:
++        raise RuntimeError(
++            'Unable to build an external URL without a request. Set the '
++            'SERVER_NAME configuration option.')
++    scheme = state.config.get('PREFERRED_URL_SCHEME', 'http')
++    return f'{scheme}://{server_name}/'
++
++
++def url_for(endpoint, **values):
++    """Build the URL of a route, given its name and its parameters."""
++    external = values.pop('_external', False)
++    anchor = values.pop('_anchor', None)
++    if state.app is None:
++        raise RuntimeError('The application has not been created yet.')
++
++    route = _find_route(endpoint)
++    if route is None:
++        raise NoMatchFound(endpoint, values)
++
++    convertors = getattr(route, 'param_convertors', None) or {}
++    path_params = {name: values.pop(name) for name in list(values)
++                   if name in convertors}
++    url = str(state.app.router.url_path_for(endpoint, **path_params))
++
++    query = urlencode([(key, value) for key, value in values.items()
++                       if value is not None], doseq=True)
++    if query:
++        url = f'{url}?{query}'
++    if anchor is not None:
++        url = f'{url}#{anchor}'
++    if external:
++        url = urljoin(_base_url(), url)
++    return url
+diff --git a/boot.sh b/boot.sh
+index 2f0992d..9ca63ce 100755
+--- a/boot.sh
++++ b/boot.sh
+@@ -1,11 +1,11 @@
+ #!/bin/bash
+ # this script is used to boot a Docker container
+ while true; do
+-    flask db upgrade
++    alembic upgrade head
+     if [[ "$?" == "0" ]]; then
+         break
+     fi
+     echo Deploy command failed, retrying in 5 secs...
+     sleep 5
+ done
+-exec gunicorn -b :5000 --access-logfile - --error-logfile - microblog:app
++exec gunicorn -b :5000 -k uvicorn.workers.UvicornWorker --access-logfile - --error-logfile - microblog:app
+diff --git a/config.py b/config.py
+index 7e50c9e..4630466 100644
+--- a/config.py
++++ b/config.py
+@@ -8,7 +8,9 @@ load_dotenv(os.path.join(basedir, '.env'))
+ class Config:
+     SECRET_KEY = os.environ.get('SECRET_KEY') or 'you-will-never-guess'
+     SERVER_NAME = os.environ.get('SERVER_NAME')
+-    SQLALCHEMY_DATABASE_URI = os.environ.get('DATABASE_URL', '').replace(
++    DEBUG = os.environ.get('DEBUG') is not None
++    TESTING = False
++    DATABASE_URI = os.environ.get('DATABASE_URL', '').replace(
+         'postgres://', 'postgresql://') or \
+         'sqlite:///' + os.path.join(basedir, 'app.db')
+     LOG_TO_STDOUT = os.environ.get('LOG_TO_STDOUT')
+diff --git a/deployment/supervisor/microblog.conf b/deployment/supervisor/microblog.conf
+index 134f18b..4a7f124 100644
+--- a/deployment/supervisor/microblog.conf
++++ b/deployment/supervisor/microblog.conf
+@@ -1,5 +1,5 @@
+ [program:microblog]
+-command=/home/ubuntu/microblog/venv/bin/gunicorn -b localhost:8000 -w 4 microblog:app
++command=/home/ubuntu/microblog/venv/bin/gunicorn -b localhost:8000 -w 4 -k uvicorn.workers.UvicornWorker microblog:app
+ directory=/home/ubuntu/microblog
+ user=ubuntu
+ autostart=true
+diff --git a/microblog.py b/microblog.py
+index 458e932..0a23b5a 100644
+--- a/microblog.py
++++ b/microblog.py
+@@ -1,12 +1,3 @@
+-import sqlalchemy as sa
+-import sqlalchemy.orm as so
+-from app import create_app, db
+-from app.models import User, Post, Message, Notification, Task
++from app import create_app
+ 
+ app = create_app()
+-
+-
+-@app.shell_context_processor
+-def make_shell_context():
+-    return {'sa': sa, 'so': so, 'db': db, 'User': User, 'Post': Post,
+-            'Message': Message, 'Notification': Notification, 'Task': Task}
+diff --git a/migrations/env.py b/migrations/env.py
+index 23663ff..446fd68 100755
+--- a/migrations/env.py
++++ b/migrations/env.py
+@@ -13,14 +13,18 @@ config = context.config
+ fileConfig(config.config_file_name)
+ logger = logging.getLogger('alembic.env')
+ 
+-# add your model's MetaData object here
+-# for 'autogenerate' support
+-# from myapp import mymodel
+-# target_metadata = mymodel.Base.metadata
+-from flask import current_app
+-config.set_main_option('sqlalchemy.url',
+-                       current_app.config.get('SQLALCHEMY_DATABASE_URI'))
+-target_metadata = current_app.extensions['migrate'].db.metadata
++# the models of the application are registered on the metadata of the
++# declarative base when the app package is imported
++from app import db
++from config import Config
++
++database_uri = Config.DATABASE_URI
++config.set_main_option('sqlalchemy.url', database_uri.replace('%', '%%'))
++target_metadata = db.Model.metadata
++
++# SQLite cannot alter tables, so migrations for it are rendered with the batch
++# operations that Flask-Migrate used to configure automatically
++render_as_batch = database_uri.startswith('sqlite')
+ 
+ # other values from the config, defined by the needs of env.py,
+ # can be acquired:
+@@ -73,7 +77,7 @@ def run_migrations_online():
+     context.configure(connection=connection,
+                       target_metadata=target_metadata,
+                       process_revision_directives=process_revision_directives,
+-                      **current_app.extensions['migrate'].configure_args)
++                      render_as_batch=render_as_batch)
+ 
+     try:
+         with context.begin_transaction():
+diff --git a/requirements.txt b/requirements.txt
+index 18a0682..17298d8 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1,54 +1,63 @@
+ aiosmtpd==1.4.4.post2
+-alembic==1.12.1
++alembic==1.16.5
++annotated-doc==0.0.5
++annotated-types==0.7.0
++anyio==4.12.1
++async-timeout==5.0.1
+ atpublic==4.0
+ attrs==23.1.0
+-Babel==2.13.1
+-blinker==1.7.0
+-certifi==2023.11.17
+-charset-normalizer==3.3.2
+-click==8.1.7
++Babel==2.18.0
++certifi==2026.7.22
++charset-normalizer==3.5.1
++click==8.1.8
++croniter==6.2.4
+ defusedxml==0.7.1
+-dnspython==2.4.2
+-elastic-transport==8.10.0
+-elasticsearch==8.11.0
+-email-validator==2.1.0.post1
+-Flask==3.0.0
+-flask-babel==4.0.0
+-Flask-HTTPAuth==4.8.0
+-Flask-Login==0.6.3
+-Flask-Mail==0.9.1
+-Flask-Migrate==4.0.5
+-Flask-Moment==1.0.5
+-Flask-SQLAlchemy==3.1.1
+-Flask-WTF==1.2.1
++dnspython==2.7.0
++elastic-transport==9.1.0
++elasticsearch==9.1.3
++email-validator==2.3.0
++exceptiongroup==1.3.1
++fastapi==0.128.8
+ greenlet==3.0.1
+ gunicorn==21.2.0
++h11==0.16.0
+ httpie==3.2.2
+-idna==3.4
+-itsdangerous==2.1.2
+-Jinja2==3.1.2
++httptools==0.8.0
++idna==3.19
++itsdangerous==2.2.0
++Jinja2==3.1.6
+ langdetect==1.0.9
+-Mako==1.3.0
++Mako==1.3.12
+ markdown-it-py==3.0.0
+-MarkupSafe==2.1.3
++MarkupSafe==3.0.3
+ mdurl==0.1.2
+ multidict==6.0.4
+ packaging==23.2
+ psycopg2-binary==2.9.9
++pydantic==2.13.4
++pydantic_core==2.46.4
+ Pygments==2.17.1
+-PyJWT==2.8.0
++PyJWT==2.13.0
+ PySocks==1.7.1
+-python-dotenv==1.0.0
+-pytz==2023.3.post1
+-redis==5.0.1
+-requests==2.31.0
++python-dateutil==2.9.0.post0
++python-dotenv==1.2.1
++python-multipart==0.0.20
++PyYAML==6.0.3
++redis==7.0.1
++requests==2.32.5
+ requests-toolbelt==1.0.0
+ rich==13.7.0
+-rq==1.15.1
++rq==2.8.0
+ setuptools==68.2.2
+-six==1.16.0
+-SQLAlchemy==2.0.23
+-typing_extensions==4.8.0
+-urllib3==2.1.0
+-Werkzeug==3.0.1
+-WTForms==3.1.1
++six==1.17.0
++SQLAlchemy==2.0.52
++starlette==0.49.3
++tomli==2.4.1
++typing-inspection==0.4.2
++typing_extensions==4.16.0
++urllib3==2.6.3
++uvicorn==0.39.0
++uvloop==0.22.1
++watchfiles==1.1.1
++websockets==15.0.1
++WTForms==3.2.1
+diff --git a/tests.py b/tests.py
+index 4ef9098..60f62d1 100755
+--- a/tests.py
++++ b/tests.py
+@@ -8,21 +8,20 @@ from config import Config
+ 
+ class TestConfig(Config):
+     TESTING = True
+-    SQLALCHEMY_DATABASE_URI = 'sqlite://'
++    DATABASE_URI = 'sqlite://'
+     ELASTICSEARCH_URL = None
+ 
+ 
+ class UserModelCase(unittest.TestCase):
+     def setUp(self):
+         self.app = create_app(TestConfig)
+-        self.app_context = self.app.app_context()
+-        self.app_context.push()
++        self.session_scope = db.new_session_scope()
+         db.create_all()
+ 
+     def tearDown(self):
+         db.session.remove()
+         db.drop_all()
+-        self.app_context.pop()
++        db.reset_session_scope(self.session_scope)
+ 
+     def test_password_hashing(self):
+         u = User(username='susan', email='susan@example.com')

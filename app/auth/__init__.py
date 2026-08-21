@@ -1,5 +1,5 @@
-from flask import Blueprint
+from fastapi import APIRouter
 
-bp = Blueprint('auth', __name__)
+bp = APIRouter()
 
 from app.auth import routes

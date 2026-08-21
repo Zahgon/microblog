@@ -2,14 +2,15 @@ import json
 import sys
 import time
 import sqlalchemy as sa
-from flask import render_template
 from rq import get_current_job
+
 from app import create_app, db
-from app.models import User, Post, Task
 from app.email import send_email
+from app.models import User, Post, Task
+from app.state import state
+from app.templating import render_to_string
 
 app = create_app()
-app.app_context().push()
 
 
 def _set_task_progress(progress):
@@ -43,14 +44,14 @@ def export_posts(user_id):
 
         send_email(
             '[Microblog] Your blog posts',
-            sender=app.config['ADMINS'][0], recipients=[user.email],
-            text_body=render_template('email/export_posts.txt', user=user),
-            html_body=render_template('email/export_posts.html', user=user),
+            sender=state.config['ADMINS'][0], recipients=[user.email],
+            text_body=render_to_string('email/export_posts.txt', user=user),
+            html_body=render_to_string('email/export_posts.html', user=user),
             attachments=[('posts.json', 'application/json',
                           json.dumps({'posts': data}, indent=4))],
             sync=True)
     except Exception:
         _set_task_progress(100)
-        app.logger.error('Unhandled exception', exc_info=sys.exc_info())
+        state.logger.error('Unhandled exception', exc_info=sys.exc_info())
     finally:
         _set_task_progress(100)

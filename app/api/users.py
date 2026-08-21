@@ -1,50 +1,51 @@
 import sqlalchemy as sa
-from flask import request, url_for, abort
+from fastapi import Depends, Request
+from starlette.exceptions import HTTPException
+from starlette.responses import JSONResponse
+
 from app import db
-from app.models import User
 from app.api import bp
 from app.api.auth import token_auth
 from app.api.errors import bad_request
+from app.models import User
+from app.params import Page, PerPage
+from app.urls import url_for
 
 
-@bp.route('/users/<int:id>', methods=['GET'])
-@token_auth.login_required
-def get_user(id):
+@bp.get('/users/{id}', name='api.get_user',
+        dependencies=[Depends(token_auth)])
+async def get_user(id: int):
     return db.get_or_404(User, id).to_dict()
 
 
-@bp.route('/users', methods=['GET'])
-@token_auth.login_required
-def get_users():
-    page = request.args.get('page', 1, type=int)
-    per_page = min(request.args.get('per_page', 10, type=int), 100)
+@bp.get('/users', name='api.get_users', dependencies=[Depends(token_auth)])
+async def get_users(page: Page = 1, per_page: PerPage = 10):
+    per_page = min(per_page, 100)
     return User.to_collection_dict(sa.select(User), page, per_page,
                                    'api.get_users')
 
 
-@bp.route('/users/<int:id>/followers', methods=['GET'])
-@token_auth.login_required
-def get_followers(id):
+@bp.get('/users/{id}/followers', name='api.get_followers',
+        dependencies=[Depends(token_auth)])
+async def get_followers(id: int, page: Page = 1, per_page: PerPage = 10):
     user = db.get_or_404(User, id)
-    page = request.args.get('page', 1, type=int)
-    per_page = min(request.args.get('per_page', 10, type=int), 100)
+    per_page = min(per_page, 100)
     return User.to_collection_dict(user.followers.select(), page, per_page,
                                    'api.get_followers', id=id)
 
 
-@bp.route('/users/<int:id>/following', methods=['GET'])
-@token_auth.login_required
-def get_following(id):
+@bp.get('/users/{id}/following', name='api.get_following',
+        dependencies=[Depends(token_auth)])
+async def get_following(id: int, page: Page = 1, per_page: PerPage = 10):
     user = db.get_or_404(User, id)
-    page = request.args.get('page', 1, type=int)
-    per_page = min(request.args.get('per_page', 10, type=int), 100)
+    per_page = min(per_page, 100)
     return User.to_collection_dict(user.following.select(), page, per_page,
                                    'api.get_following', id=id)
 
 
-@bp.route('/users', methods=['POST'])
-def create_user():
-    data = request.get_json()
+@bp.post('/users', name='api.create_user')
+async def create_user(request: Request):
+    data = await request.json()
     if 'username' not in data or 'email' not in data or 'password' not in data:
         return bad_request('must include username, email and password fields')
     if db.session.scalar(sa.select(User).where(
@@ -57,17 +58,17 @@ def create_user():
     user.from_dict(data, new_user=True)
     db.session.add(user)
     db.session.commit()
-    return user.to_dict(), 201, {'Location': url_for('api.get_user',
-                                                     id=user.id)}
+    return JSONResponse(user.to_dict(), status_code=201, headers={
+        'Location': url_for('api.get_user', id=user.id)})
 
 
-@bp.route('/users/<int:id>', methods=['PUT'])
-@token_auth.login_required
-def update_user(id):
-    if token_auth.current_user().id != id:
-        abort(403)
+@bp.put('/users/{id}', name='api.update_user')
+async def update_user(id: int, request: Request,
+                      token_user: User = Depends(token_auth)):
+    if token_user.id != id:
+        raise HTTPException(status_code=403)
     user = db.get_or_404(User, id)
-    data = request.get_json()
+    data = await request.json()
     if 'username' in data and data['username'] != user.username and \
         db.session.scalar(sa.select(User).where(
             User.username == data['username'])):
